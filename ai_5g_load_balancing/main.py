@@ -1,7 +1,11 @@
-﻿import matplotlib.pyplot as plt
-from models import BaseStation, UserEquipment
+﻿import argparse
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from controller import load_aware_policy, strongest_signal_policy
 from environment import NetworkEnvironment
-from controller import strongest_signal_policy, load_aware_policy
+from models import BaseStation, UserEquipment
+from rl_models import QNetwork
 
 
 def build_network():
@@ -15,10 +19,52 @@ def build_network():
     return base_stations, users
 
 
-def plot_results(hist1, hist2):
+class DQNInferenceAgent:
+    def __init__(self, state_dim, action_dim, weights_path, device=None):
+        self.device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self.model = QNetwork(state_dim, action_dim).to(self.device)
+        state_dict = torch.load(weights_path, map_location=self.device)
+        self.model.load_state_dict(state_dict)
+        self.model.eval()
+
+    def act(self, states, candidate_map):
+        state_tensor = torch.from_numpy(states).float().to(self.device)
+        with torch.no_grad():
+            q_values = self.model(state_tensor).cpu().numpy()
+        actions = []
+        for i, candidates in enumerate(candidate_map):
+            if len(candidates) == 0:
+                actions.append(0)
+            else:
+                actions.append(int(np.argmax(q_values[i, : len(candidates)])))
+        return actions
+
+
+def run_dqn_episode(weights_path, steps):
+    bs, users = build_network()
+    env = NetworkEnvironment(bs, users)
+    states, candidate_map = env.reset_for_rl()
+    agent = DQNInferenceAgent(
+        state_dim=states.shape[1],
+        action_dim=env.rl_config.get("num_candidates", 3),
+        weights_path=weights_path,
+    )
+
+    for _ in range(steps):
+        actions = agent.act(states, candidate_map)
+        states, _, info = env.step_with_actions(
+            actions, candidate_map=candidate_map, update_history=True
+        )
+        candidate_map = info["candidate_map"]
+    return env.history
+
+
+def plot_results(histories):
     plt.figure(figsize=(10, 4))
-    plt.plot(hist1["avg_throughput"], label="Baseline Throughput")
-    plt.plot(hist2["avg_throughput"], label="Load-Aware Throughput")
+    for label, hist in histories.items():
+        plt.plot(hist["avg_throughput"], label=f"{label} Throughput")
     plt.xlabel("Time step")
     plt.ylabel("Average Throughput (Mbps)")
     plt.legend()
@@ -26,8 +72,8 @@ def plot_results(hist1, hist2):
     plt.show()
 
     plt.figure(figsize=(10, 4))
-    plt.plot(hist1["max_load"], label="Baseline Max Load")
-    plt.plot(hist2["max_load"], label="Load-Aware Max Load")
+    for label, hist in histories.items():
+        plt.plot(hist["max_load"], label=f"{label} Max Load")
     plt.xlabel("Time step")
     plt.ylabel("Maximum Cell Load")
     plt.legend()
@@ -35,8 +81,8 @@ def plot_results(hist1, hist2):
     plt.show()
 
     plt.figure(figsize=(10, 4))
-    plt.plot(hist1["avg_latency_ms"], label="Baseline Avg Latency")
-    plt.plot(hist2["avg_latency_ms"], label="Load-Aware Avg Latency")
+    for label, hist in histories.items():
+        plt.plot(hist["avg_latency_ms"], label=f"{label} Avg Latency")
     plt.xlabel("Time step")
     plt.ylabel("Avg Latency (ms)")
     plt.legend()
@@ -44,10 +90,9 @@ def plot_results(hist1, hist2):
     plt.show()
 
     plt.figure(figsize=(10, 4))
-    baseline_cum = _cumulative(hist1["handover_count"])
-    ai_cum = _cumulative(hist2["handover_count"])
-    plt.plot(baseline_cum, label="Baseline Cum. Handovers")
-    plt.plot(ai_cum, label="Load-Aware Cum. Handovers")
+    for label, hist in histories.items():
+        cum = _cumulative(hist["handover_count"])
+        plt.plot(cum, label=f"{label} Cum. Handovers")
     plt.xlabel("Time step")
     plt.ylabel("Cumulative Handovers")
     plt.legend()
@@ -72,19 +117,46 @@ def print_summary(label, hist):
     print(f"{label} total handovers: {sum(hist['handover_count'])}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="5G load-balancing demo")
+    parser.add_argument("--steps", type=int, default=60, help="Simulation steps")
+    parser.add_argument(
+        "--dqn-weights",
+        type=str,
+        default=None,
+        help="Path to trained DQN weights for evaluation",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Skip matplotlib plotting (useful for headless runs)",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    steps = args.steps
+
     bs1, users1 = build_network()
     env1 = NetworkEnvironment(bs1, users1)
-    baseline_hist = env1.run(strongest_signal_policy, steps=60)
+    baseline_hist = env1.run(strongest_signal_policy, steps=steps)
 
     bs2, users2 = build_network()
     env2 = NetworkEnvironment(bs2, users2)
-    ai_hist = env2.run(load_aware_policy, steps=60)
+    ai_hist = env2.run(load_aware_policy, steps=steps)
 
-    print_summary("Baseline", baseline_hist)
-    print_summary("Load-aware", ai_hist)
+    histories = {"Baseline": baseline_hist, "Load-aware": ai_hist}
 
-    plot_results(baseline_hist, ai_hist)
+    if args.dqn_weights:
+        dqn_hist = run_dqn_episode(args.dqn_weights, steps=steps)
+        histories["DQN"] = dqn_hist
+
+    for label, hist in histories.items():
+        print_summary(label, hist)
+
+    if not args.no_plots:
+        plot_results(histories)
 
 
 if __name__ == "__main__":
