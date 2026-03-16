@@ -67,8 +67,3 @@ python main.py --dqn-weights artifacts/dqn_weights.pt --steps 60
 ```
 
 This runs the baseline, load-aware heuristic, and the loaded DQN policy side by side, prints the KPI summary for each, and plots all histories (use `--no-plots` if running remotely).
-
-## Notes
-
-- Call the heuristic a *load-aware* or *AI-inspired* controller, reserving the AI label for the future RL version.
-- Suggested résumé line: “Built a multi-cell 5G RAN simulator with mobile UEs, then developed a load-aware association controller that improved throughput, reduced congestion, and cut handovers versus strongest-signal baselines.”
