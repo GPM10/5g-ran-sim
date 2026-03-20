@@ -1,22 +1,11 @@
-﻿import argparse
+import argparse
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from controller import load_aware_policy, strongest_signal_policy
 from environment import NetworkEnvironment
-from models import BaseStation, UserEquipment
 from rl_models import QNetwork
-
-
-def build_network():
-    base_stations = [
-        BaseStation(0, 20, 20, capacity_mbps=40),
-        BaseStation(1, 50, 80, capacity_mbps=40),
-        BaseStation(2, 80, 30, capacity_mbps=40),
-    ]
-
-    users = [UserEquipment(i, x=(i * 7) % 100, y=(i * 13) % 100) for i in range(30)]
-    return base_stations, users
+from topology import build_network_from_spec, build_reference_network, load_topology_spec
 
 
 class DQNInferenceAgent:
@@ -42,8 +31,15 @@ class DQNInferenceAgent:
         return actions
 
 
-def run_dqn_episode(weights_path, steps):
-    bs, users = build_network()
+def build_network(topology_path=None):
+    if topology_path:
+        spec = load_topology_spec(topology_path)
+        return build_network_from_spec(spec)
+    return build_reference_network()
+
+
+def run_dqn_episode(weights_path, steps, topology_path=None):
+    bs, users = build_network(topology_path)
     env = NetworkEnvironment(bs, users)
     states, candidate_map = env.reset_for_rl()
     agent = DQNInferenceAgent(
@@ -67,6 +63,15 @@ def plot_results(histories):
         plt.plot(hist["avg_throughput"], label=f"{label} Throughput")
     plt.xlabel("Time step")
     plt.ylabel("Average Throughput (Mbps)")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(10, 4))
+    for label, hist in histories.items():
+        plt.plot(hist["avg_queue_mbits"], label=f"{label} Avg Queue (Mbits)")
+    plt.xlabel("Time step")
+    plt.ylabel("Avg Queue Backlog (Mbits)")
     plt.legend()
     plt.tight_layout()
     plt.show()
@@ -113,6 +118,7 @@ def print_summary(label, hist):
     print(f"{label} final avg throughput (Mbps): {hist['avg_throughput'][-1]:.2f}")
     print(f"{label} final max load: {hist['max_load'][-1]:.2f}")
     print(f"{label} final avg latency (ms): {hist['avg_latency_ms'][-1]:.2f}")
+    print(f"{label} avg queue backlog (Mbits): {hist['avg_queue_mbits'][-1]:.2f}")
     print(f"{label} average SINR (dB): {hist['avg_sinr_db'][-1]:.2f}")
     print(f"{label} total handovers: {sum(hist['handover_count'])}")
 
@@ -131,6 +137,12 @@ def parse_args():
         action="store_true",
         help="Skip matplotlib plotting (useful for headless runs)",
     )
+    parser.add_argument(
+        "--topology",
+        type=str,
+        default=None,
+        help="Path to a JSON topology spec (defaults to built-in macro/micro)",
+    )
     return parser.parse_args()
 
 
@@ -138,18 +150,18 @@ def main():
     args = parse_args()
     steps = args.steps
 
-    bs1, users1 = build_network()
+    bs1, users1 = build_network(args.topology)
     env1 = NetworkEnvironment(bs1, users1)
     baseline_hist = env1.run(strongest_signal_policy, steps=steps)
 
-    bs2, users2 = build_network()
+    bs2, users2 = build_network(args.topology)
     env2 = NetworkEnvironment(bs2, users2)
     ai_hist = env2.run(load_aware_policy, steps=steps)
 
     histories = {"Baseline": baseline_hist, "Load-aware": ai_hist}
 
     if args.dqn_weights:
-        dqn_hist = run_dqn_episode(args.dqn_weights, steps=steps)
+        dqn_hist = run_dqn_episode(args.dqn_weights, steps=steps, topology_path=args.topology)
         histories["DQN"] = dqn_hist
 
     for label, hist in histories.items():

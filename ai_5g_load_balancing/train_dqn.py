@@ -31,11 +31,15 @@ from rl_models import QNetwork
 
 def build_network():
     base_stations = [
-        BaseStation(0, 20, 20, capacity_mbps=40),
-        BaseStation(1, 50, 80, capacity_mbps=40),
-        BaseStation(2, 80, 30, capacity_mbps=40),
+        BaseStation(0, 20, 20, tier="macro"),
+        BaseStation(1, 80, 20, tier="macro"),
+        BaseStation(2, 50, 80, tier="macro"),
+        BaseStation(3, 35, 55, tier="micro"),
+        BaseStation(4, 70, 60, tier="micro"),
     ]
-    users = [UserEquipment(i, x=(i * 7) % 100, y=(i * 13) % 100) for i in range(30)]
+    users = [
+        UserEquipment(i, x=(i * 7) % 100, y=(i * 13) % 100) for i in range(40)
+    ]
     return base_stations, users
 
 

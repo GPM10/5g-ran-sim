@@ -1,3 +1,9 @@
-﻿numpy
+numpy
 matplotlib
 torch
+fastapi
+uvicorn
+httpx
+streamlit
+pandas
+altair
