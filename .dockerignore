@@ -1,0 +1,15 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+.pytest_cache
+.mypy_cache
+.DS_Store
+Thumbs.db
+artifacts
+logs
+.git
+.gitignore

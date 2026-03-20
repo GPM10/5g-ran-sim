@@ -1,0 +1,34 @@
+services:
+  ric-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.ric_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ai_5g_load_balancing/artifacts:/app/artifacts
+      - ./topologies/hotspot_dense.json:/app/topology.json:ro
+    environment:
+      TOPOLOGY_FILE: /app/topology.json
+    restart: unless-stopped
+
+  xapp-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.xapp
+    depends_on:
+      - ric-api
+    command: ["--api-base", "http://ric-api:8000", "--interval", "1.0", "--steps", "0"]
+    volumes:
+      - ./ai_5g_load_balancing/artifacts:/app/artifacts
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    depends_on:
+      - ric-api
+    environment:
+      API_BASE: http://ric-api:8000
+    ports:
+      - "8501:8501"

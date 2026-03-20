@@ -1,0 +1,21 @@
+{
+  "area_size": 120,
+  "num_users": 60,
+  "base_stations": [
+    {"bs_id": 0, "x": 10, "y": 20, "tier": "macro"},
+    {"bs_id": 1, "x": 90, "y": 25, "tier": "macro"},
+    {"bs_id": 2, "x": 60, "y": 100, "tier": "macro"},
+    {"bs_id": 3, "x": 35, "y": 50, "tier": "micro"},
+    {"bs_id": 4, "x": 65, "y": 60, "tier": "micro"},
+    {"bs_id": 5, "x": 45, "y": 40, "tier": "micro"},
+    {"bs_id": 6, "x": 75, "y": 70, "tier": "micro"}
+  ],
+  "user_positions": [
+    {"x": 30, "y": 45, "traffic_profile": "urllc"},
+    {"x": 32, "y": 47, "traffic_profile": "urllc"},
+    {"x": 70, "y": 65, "traffic_profile": "embb"},
+    {"x": 72, "y": 68, "traffic_profile": "embb"},
+    {"x": 50, "y": 90, "traffic_profile": "mmtc"},
+    {"x": 20, "y": 15, "traffic_profile": "urllc"}
+  ]
+}
