@@ -35,9 +35,12 @@ ai_5g_load_balancing/
 ### Simulator realism knobs
 
 - **Multi-tier deployment** – macros transmit at higher power/bandwidth, micros densify hotspots. LOS/NLOS probability and path-loss parameters are tier-aware.
+- **3D + site-specific propagation** – the new path-loss plugin supports legacy intercept/ exponent, COST231, and NYU mmWave models with LOS/NLOS fallbacks, beam-height offsets, and optional blockage penalties per UE environment tag.
+- **Multi-band carriers** – each base station can advertise multiple carriers (e.g., mid-band + mmWave). The scheduler now allocates RBs per carrier and aggregates user throughput/CQI accordingly, so carrier aggregation and ICIC experiments are straightforward.
 - **Advanced channel model** – LOS links use Rician fading, NLOS links fall back to Rayleigh/Nakagami with optional log-normal shadowing.
 - **Queue-based latency** – each UE maintains a backlog (in Mbits); latency is derived from queue drain time vs. latency budget instead of a heuristic ratio.
-- **Schedulers** – proportional-fair scheduling is enabled by default (round-robin is available via `scheduler_mode`), and base-station load is derived from requested traffic vs. capacity.
+- **Schedulers** – proportional-fair scheduling is enabled by default (round-robin is available via `scheduler_mode`), and base-station load is derived from requested traffic vs. multi-carrier capacity.
+- **Mobility + demand shaping** – every UE tracks heading, speed, and optional trajectories (pedestrian, vehicular, indoor, or trace-driven). A demand shaper injects daily seasonality and cluster spikes (stadium/incident bursts) so controllers can reason about correlated traffic.
 
 ## RL API (Phase 2)
 
@@ -88,21 +91,45 @@ This runs the baseline, load-aware heuristic, and the loaded DQN policy side by 
   "area_size": 120,
   "num_users": 60,
   "base_stations": [
-    {"bs_id": 0, "x": 10, "y": 20, "tier": "macro"},
+    {
+      "bs_id": 0,
+      "x": 10,
+      "y": 20,
+      "z": 5,
+      "tier": "macro",
+      "carriers": [
+        {"name": "midband", "frequency_ghz": 3.5, "bandwidth_mhz": 40},
+        {"name": "mmwave", "frequency_ghz": 28, "bandwidth_mhz": 100, "path_loss_model": "nyu_mmwave"}
+      ]
+    },
     {"bs_id": 1, "x": 90, "y": 25, "tier": "macro"},
     {"bs_id": 2, "x": 60, "y": 100, "tier": "macro"},
-    {"bs_id": 3, "x": 35, "y": 50, "tier": "micro"}
+    {"bs_id": 3, "x": 35, "y": 50, "tier": "micro", "height_m": 18}
   ],
   "user_positions": [
-    {"x": 30, "y": 45, "traffic_profile": "urllc"},
-    {"x": 70, "y": 65, "traffic_profile": "embb"}
+    {
+      "x": 30,
+      "y": 45,
+      "z": 2,
+      "environment": "indoor",
+      "traffic_profile": "urllc",
+      "mobility_profile": "pedestrian",
+      "trajectory": [{"x": 35, "y": 50, "hold_steps": 3}, {"x": 40, "y": 70}]
+    },
+    {"x": 70, "y": 65, "traffic_profile": "embb", "mobility_profile": "vehicular"}
   ]
 }
 ```
 
-- `base_stations`: required; each entry can optionally override `capacity_mbps`, `tx_power_dbm`, `bandwidth_mhz`, or `resource_blocks`.
+- `base_stations`: required; each entry can override `capacity_mbps`, antenna geometry (`z`, `height_m`, `tilt_deg`, etc.), or pass an explicit `carriers` array (frequency/bandwidth/RB/power/path-loss model). When `carriers` is omitted the tier defaults are used.
 - `num_users` + `area_size`: used for deterministic UE seeding when `user_positions` is omitted.
-- `user_positions`: optional; when present, the UE count equals the length of this list (each entry may set a `traffic_profile`).
+- `user_positions`: optional; when present, the UE count equals the length of this list (each entry may set a `traffic_profile`, `environment`, `z` height, `mobility_profile`, or an explicit `trajectory` of waypoints).
+
+### Mobility + traffic shaping tips
+
+- Supported traffic profiles: `embb`, `urllc`, `mmtc`, `conversational`, `massive_iot`, and `control`. Each profile encodes latency budgets plus arrival distributions (Gaussian, Gamma, Pareto, spiky, deterministic).
+- Set `mobility_profile` (`pedestrian`, `vehicular`, `indoor`, `static`) per UE or supply a `trajectory` array of waypoints (`x`, `y`, optional `speed_m_s` / `hold_steps`) to replay SUMO/GPS traces.
+- `DEFAULT_RL_CONFIG["demand_shape"]` controls daily seasonality and spike probabilities for correlated load (e.g., stadium events). Override via `--config` or by editing `environment.py` to emulate emergencies or seasonal peaks.
 
 ### Using a custom spec
 

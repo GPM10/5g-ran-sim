@@ -10,7 +10,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from controller import load_aware_policy
+from controller import predictive_mobility_policy
 from environment import NetworkEnvironment
 from topology import (
     build_network_from_spec,
@@ -147,7 +147,7 @@ class SimulationManager:
     def _heuristic_actions(self) -> List[int]:
         actions = []
         for idx, ue in enumerate(self.env.users):
-            best_bs = load_aware_policy(ue, self.env.base_stations)
+            best_bs = predictive_mobility_policy(ue, self.env.base_stations)
             actions.append(self._candidate_index(idx, best_bs.bs_id))
         return actions
 
@@ -186,6 +186,19 @@ class SimulationManager:
                     "capacity_mbps": bs.capacity_mbps,
                     "x": float(bs.x),
                     "y": float(bs.y),
+                    "z": float(bs.z),
+                    "height_m": float(bs.height_m),
+                    "carriers": [
+                        {
+                            "name": carrier.name,
+                            "frequency_ghz": carrier.frequency_ghz,
+                            "bandwidth_mhz": carrier.bandwidth_mhz,
+                            "tx_power_dbm": carrier.tx_power_dbm,
+                            "capacity_mbps": carrier.capacity_mbps,
+                            "resource_blocks": carrier.resource_blocks,
+                        }
+                        for carrier in bs.iter_carriers()
+                    ],
                 }
             )
             loads.append(bs.load)
@@ -220,6 +233,9 @@ class SimulationManager:
                     "latency_budget_ms": ue.latency_budget_ms,
                     "x": float(ue.x),
                     "y": float(ue.y),
+                    "z": float(getattr(ue, "z", 0.0)),
+                    "environment": getattr(ue, "environment", "urban"),
+                    "velocity_m_s": float(getattr(ue, "velocity_m_s", 0.0)),
                 }
             )
             latencies.append(metrics["latency"])
@@ -244,6 +260,7 @@ class SimulationManager:
                 [self.env.base_stations[idx].bs_id for idx in candidates]
                 for candidates in self.candidate_map
             ],
+            "demand_event": self.env.last_demand_event,
         }
         return snapshot
 

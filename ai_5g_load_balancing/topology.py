@@ -1,7 +1,7 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 
 from models import BaseStation, UserEquipment
 
@@ -11,18 +11,30 @@ class BaseStationSpec:
     bs_id: int
     x: float
     y: float
+    z: float = 0.0
+    height_m: float = 25.0
     tier: str = "macro"
     capacity_mbps: Optional[float] = None
     tx_power_dbm: Optional[float] = None
     bandwidth_mhz: Optional[float] = None
     resource_blocks: Optional[int] = None
+    path_loss_model: Optional[str] = None
+    path_loss_params: Optional[dict] = None
+    carriers: Optional[List[dict]] = field(default=None)
+    azimuth_deg: float = 0.0
+    tilt_deg: float = 5.0
+    beamwidth_deg: float = 65.0
 
 
 @dataclass
 class UserSeed:
     x: float
     y: float
+    z: float = 1.5
     traffic_profile: Optional[str] = None
+    environment: str = "urban"
+    mobility_profile: Optional[str] = None
+    trajectory: Optional[List[dict]] = None
 
 
 @dataclass
@@ -55,11 +67,19 @@ def build_network_from_spec(spec: TopologySpec):
             s.bs_id,
             s.x,
             s.y,
+            z=s.z,
             tier=s.tier,
             capacity_mbps=s.capacity_mbps,
             tx_power_dbm=s.tx_power_dbm,
             bandwidth_mhz=s.bandwidth_mhz,
             resource_blocks=s.resource_blocks,
+            height_m=s.height_m,
+            azimuth_deg=s.azimuth_deg,
+            tilt_deg=s.tilt_deg,
+            beamwidth_deg=s.beamwidth_deg,
+            path_loss_model=s.path_loss_model,
+            path_loss_params=s.path_loss_params,
+            carriers=s.carriers,
         )
         for s in spec.base_stations
     ]
@@ -70,7 +90,11 @@ def build_network_from_spec(spec: TopologySpec):
                 idx,
                 x=seed.x,
                 y=seed.y,
+                z=seed.z,
                 traffic_profile=seed.traffic_profile,
+                environment=seed.environment,
+                mobility_profile=seed.mobility_profile or "pedestrian",
+                trajectory=seed.trajectory,
             )
             for idx, seed in enumerate(spec.user_positions)
         ]

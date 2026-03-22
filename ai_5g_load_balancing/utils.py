@@ -1,6 +1,6 @@
-﻿import numpy as np
+import numpy as np
 
-NOISE_FLOOR_DBM = -104  # thermal noise for ~20 MHz channel
+NOISE_FLOOR_DBM = -104  # thermal noise reference
 
 # Fading configuration defaults
 FADING_CONFIG = {
@@ -13,38 +13,112 @@ FADING_CONFIG = {
 }
 
 
-def distance(x1, y1, x2, y2):
-    return np.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+def link_distance(ue, bs):
+    bs_height = getattr(bs, "height_m", 0.0)
+    ue_z = getattr(ue, "z", 0.0)
+    ue_height = getattr(ue, "height_m", 1.5) if hasattr(ue, "height_m") else 1.5
+    x_term = (ue.x - bs.x) ** 2
+    y_term = (ue.y - bs.y) ** 2
+    z_term = (ue_z + ue_height - (bs.z + bs_height)) ** 2
+    return np.sqrt(x_term + y_term + z_term)
 
 
-def los_probability(distance_m, tier):
+def los_probability(distance_m, tier, environment=None):
     distance_m = max(distance_m, 1.0)
     if tier == "micro":
-        if distance_m <= 18:
-            return 0.9
-        return max(0.1, np.exp(-(distance_m - 18) / 36))
-    # macro default
-    if distance_m <= 30:
-        return 0.95
-    return max(0.05, np.exp(-(distance_m - 30) / 80))
+        base = 0.9 if distance_m <= 18 else max(0.1, np.exp(-(distance_m - 18) / 36))
+    else:
+        base = 0.95 if distance_m <= 30 else max(
+            0.05, np.exp(-(distance_m - 30) / 80)
+        )
+    if environment == "indoor":
+        base *= 0.6
+    return float(np.clip(base, 0.01, 0.99))
 
 
-def path_loss_db(distance_m, bs, is_los=True):
-    params = bs.path_loss_params
+def _legacy_path_loss(distance_m, params, is_los):
     exp = params["los_exp"] if is_los else params["nlos_exp"]
     intercept = params["los_intercept"] if is_los else params["nlos_intercept"]
     distance_m = max(distance_m, 1.0)
     return intercept + 10 * exp * np.log10(distance_m)
 
 
-def received_power_dbm(bs, distance_m, is_los=True):
-    return bs.tx_power_dbm - path_loss_db(distance_m, bs, is_los=is_los)
+def _free_space_loss(distance_m, frequency_ghz, **_):
+    distance_km = max(distance_m / 1000.0, 1e-3)
+    freq_mhz = max(frequency_ghz * 1000.0, 1.0)
+    return 32.45 + 20.0 * np.log10(distance_km) + 20.0 * np.log10(freq_mhz)
+
+
+def _cost231_loss(distance_m, frequency_ghz, bs, ue_height=1.5, **kwargs):
+    params = kwargs.get("params", {})
+    distance_km = max(distance_m / 1000.0, 1e-3)
+    freq_mhz = max(frequency_ghz * 1000.0, 150.0)
+    hb = max(getattr(bs, "height_m", 25.0), 5.0)
+    hm = max(ue_height, 1.0)
+    c_env = params.get("environment_correction_db", 3.0)
+    a_hm = (1.1 * np.log10(freq_mhz) - 0.7) * hm - (1.56 * np.log10(freq_mhz) - 0.8)
+    return (
+        46.3
+        + 33.9 * np.log10(freq_mhz)
+        - 13.82 * np.log10(hb)
+        - a_hm
+        + (44.9 - 6.55 * np.log10(hb)) * np.log10(distance_km)
+        + c_env
+    )
+
+
+def _nyu_mmwave_loss(distance_m, frequency_ghz, is_los=True, **kwargs):
+    params = kwargs.get("params", {})
+    n_los = params.get("los_exp", 2.0)
+    n_nlos = params.get("nlos_exp", 3.2)
+    sigma_los = params.get("los_sigma_db", 4.0)
+    sigma_nlos = params.get("nlos_sigma_db", 7.0)
+    intercept = 32.4
+    path_exp = n_los if is_los else n_nlos
+    sigma = sigma_los if is_los else sigma_nlos
+    distance_m = max(distance_m, 1.0)
+    return (
+        intercept
+        + 10 * path_exp * np.log10(distance_m)
+        + 20 * np.log10(max(frequency_ghz, 0.1))
+        + np.random.normal(0.0, sigma)
+    )
+
+
+PATH_LOSS_MODELS = {
+    "free_space": _free_space_loss,
+    "cost231": _cost231_loss,
+    "nyu_mmwave": _nyu_mmwave_loss,
+}
+
+
+def path_loss_db(distance_m, bs, carrier, ue_height=1.5, is_los=True):
+    params = carrier.path_loss_params or bs.path_loss_params or {}
+    model_name = (carrier.path_loss_model or bs.path_loss_model or "free_space").lower()
+    if {"los_exp", "nlos_exp", "los_intercept", "nlos_intercept"} <= params.keys():
+        return _legacy_path_loss(distance_m, params, is_los=is_los)
+    model_fn = PATH_LOSS_MODELS.get(model_name, _free_space_loss)
+    return model_fn(
+        distance_m=distance_m,
+        frequency_ghz=getattr(carrier, "frequency_ghz", 3.5),
+        bs=bs,
+        ue_height=ue_height,
+        params=params,
+        is_los=is_los,
+    )
+
+
+def received_power_dbm(ue, bs, carrier, is_los=True):
+    dist = link_distance(ue, bs)
+    ue_height = getattr(ue, "height_m", 1.5)
+    loss = path_loss_db(dist, bs, carrier, ue_height=ue_height, is_los=is_los)
+    return carrier.tx_power_dbm - loss
 
 
 def signal_strength(ue, bs):
-    """Return expected LOS received power in dBm (used by association policies)."""
-    d = distance(ue.x, ue.y, bs.x, bs.y)
-    return received_power_dbm(bs, d, is_los=True)
+    """Return expected LOS received power in dBm for the BS primary carrier."""
+    carrier = bs.primary_carrier
+    return received_power_dbm(ue, bs, carrier, is_los=True)
 
 
 def dbm_to_mw(dbm):
@@ -93,10 +167,22 @@ def sample_fading_gain_link(is_los, config=None):
     return fast
 
 
-def sinr_linear(ue, serving_bs, base_stations, fading_config=None):
-    d_serv = distance(ue.x, ue.y, serving_bs.x, serving_bs.y)
-    los_serv = np.random.rand() < los_probability(d_serv, serving_bs.tier)
-    signal_dbm = received_power_dbm(serving_bs, d_serv, is_los=los_serv)
+def _match_carrier(other_bs, carrier):
+    match = other_bs.get_carrier(carrier.name)
+    if match:
+        return match
+    for cand in other_bs.iter_carriers():
+        if abs(cand.frequency_ghz - carrier.frequency_ghz) <= 0.25:
+            return cand
+    return None
+
+
+def sinr_linear(ue, serving_bs, base_stations, carrier, fading_config=None):
+    d_serv = link_distance(ue, serving_bs)
+    los_serv = np.random.rand() < los_probability(
+        d_serv, serving_bs.tier, environment=getattr(ue, "environment", None)
+    )
+    signal_dbm = received_power_dbm(ue, serving_bs, carrier, is_los=los_serv)
     signal_mw = dbm_to_mw(signal_dbm) * sample_fading_gain_link(
         los_serv, fading_config
     )
@@ -105,9 +191,14 @@ def sinr_linear(ue, serving_bs, base_stations, fading_config=None):
     for other in base_stations:
         if other.bs_id == serving_bs.bs_id:
             continue
-        d_int = distance(ue.x, ue.y, other.x, other.y)
-        los_int = np.random.rand() < los_probability(d_int, other.tier)
-        power_dbm = received_power_dbm(other, d_int, is_los=los_int)
+        other_carrier = _match_carrier(other, carrier)
+        if other_carrier is None:
+            continue
+        d_int = link_distance(ue, other)
+        los_int = np.random.rand() < los_probability(
+            d_int, other.tier, environment=getattr(ue, "environment", None)
+        )
+        power_dbm = received_power_dbm(ue, other, other_carrier, is_los=los_int)
         interference_mw += dbm_to_mw(power_dbm) * sample_fading_gain_link(
             los_int, fading_config
         )
@@ -122,6 +213,8 @@ def sinr_linear(ue, serving_bs, base_stations, fading_config=None):
 def shannon_throughput_mbps(sinr_value, bandwidth_mhz):
     spectral_eff = np.log2(1 + sinr_value)
     return (bandwidth_mhz * 1e6 * spectral_eff) / 1e6
+
+
 CQI_THRESHOLDS_DB = [
     -6.7,
     -4.7,
@@ -172,19 +265,27 @@ def cqi_to_efficiency(cqi_idx):
     return MCS_EFFICIENCY[cqi_idx]
 
 
-def phy_rate_from_rbs(bs, cqi_efficiency, allocated_rbs):
+def phy_rate_from_rbs(bandwidth_mhz, resource_blocks, cqi_efficiency, allocated_rbs):
     if allocated_rbs <= 0:
         return 0.0
-    rb_bw_hz = (bs.bandwidth_mhz * 1e6) / max(bs.resource_blocks, 1)
+    total_rbs = max(resource_blocks, 1)
+    rb_bw_hz = (bandwidth_mhz * 1e6) / total_rbs
     rb_rate_mbps = cqi_efficiency * rb_bw_hz / 1e6
     return rb_rate_mbps * allocated_rbs
 
 
-def user_throughput_from_phy(ue, bs, sinr_val, allocated_rbs, timestep_s=1.0):
+def user_throughput_from_phy(
+    ue,
+    bandwidth_mhz,
+    resource_blocks,
+    sinr_val,
+    allocated_rbs,
+    timestep_s=1.0,
+):
     sinr_db = 10 * np.log10(sinr_val + 1e-9)
     cqi = sinr_to_cqi(sinr_db)
     eff = cqi_to_efficiency(cqi)
-    phy_rate = phy_rate_from_rbs(bs, eff, allocated_rbs)
+    phy_rate = phy_rate_from_rbs(bandwidth_mhz, resource_blocks, eff, allocated_rbs)
     backlog_rate = ue.backlog_mbits / max(timestep_s, 1e-6)
     desired_rate = max(backlog_rate, ue.demand)
     served_rate = min(phy_rate, desired_rate)

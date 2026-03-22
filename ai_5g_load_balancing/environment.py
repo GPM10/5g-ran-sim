@@ -19,11 +19,64 @@ DEFAULT_RL_CONFIG = {
     "max_demand_mbps": 8.0,
     "max_latency_ms": 200.0,
     "max_bs_capacity_mbps": 100.0,
+    "max_ue_speed_m_s": 20.0,
     "timestep_s": 1.0,
     "scheduler_mode": "pf",  # pf | rr
     "sinr_target_db": 0.0,
+    "demand_shape": {
+        "season_period_steps": 200,
+        "season_amplitude": 0.25,
+        "spike_probability": 0.08,
+        "spike_strength": [2.0, 6.0],
+        "cluster_ratio": 0.3,
+    },
 }
 SIGNAL_DBM_RANGE = (-120.0, -40.0)
+
+
+class DemandShaper:
+    def __init__(self, num_users, config=None):
+        self.num_users = num_users
+        cfg = config or {}
+        self.season_period = max(int(cfg.get("season_period_steps", 120)), 1)
+        self.season_amplitude = float(cfg.get("season_amplitude", 0.2))
+        self.spike_probability = float(cfg.get("spike_probability", 0.05))
+        strength = cfg.get("spike_strength", (2.0, 5.0))
+        if isinstance(strength, (list, tuple)) and len(strength) == 2:
+            self.spike_strength = (float(strength[0]), float(strength[1]))
+        else:
+            self.spike_strength = (2.0, 5.0)
+        self.cluster_ratio = float(cfg.get("cluster_ratio", 0.25))
+        self.current_step = 0
+        self.last_event = None
+
+    def reset(self):
+        self.current_step = 0
+        self.last_event = None
+
+    def step(self):
+        self.current_step += 1
+        base = 1.0 + self.season_amplitude * np.sin(
+            2 * np.pi * self.current_step / self.season_period
+        )
+        multipliers = np.full(self.num_users, base, dtype=np.float32)
+        event = None
+        if np.random.rand() < self.spike_probability:
+            cluster_size = max(
+                1, int(self.cluster_ratio * self.num_users)
+            )
+            affected = np.random.choice(
+                self.num_users, cluster_size, replace=False
+            )
+            spike = np.random.uniform(*self.spike_strength)
+            multipliers[affected] *= spike
+            event = {
+                "step": self.current_step,
+                "affected_users": affected.tolist(),
+                "multiplier": float(spike),
+            }
+        self.last_event = event
+        return multipliers, event
 
 
 class NetworkEnvironment:
@@ -37,6 +90,18 @@ class NetworkEnvironment:
         self.prev_loads = np.zeros(len(self.base_stations), dtype=np.float32)
         self.last_latency = {u.ue_id: u.latency_budget_ms for u in self.users}
         self._last_candidate_map = None
+        self.area_size = int(
+            max(
+                self.rl_config.get("area_size", 120),
+                max(bs.x for bs in self.base_stations) + 10,
+                max(bs.y for bs in self.base_stations) + 10,
+            )
+        )
+        self.demand_shaper = DemandShaper(
+            len(self.users), self.rl_config.get("demand_shape", {})
+        )
+        self.last_demand_event = None
+        self._last_demand_factors = np.ones(len(self.users), dtype=np.float32)
 
     def _blank_history(self):
         return {
@@ -61,8 +126,13 @@ class NetworkEnvironment:
     # ------------------------------------------------------------------
     def step(self, association_policy):
         handover_events = {}
-        for u in self.users:
-            u.move(slot_duration_s=self.timestep_s)
+        demand_factors = self._next_demand_factors()
+        for idx, u in enumerate(self.users):
+            u.move(
+                area_size=self.area_size,
+                slot_duration_s=self.timestep_s,
+                demand_factor=demand_factors[idx],
+            )
 
         self.reset_bs()
 
@@ -95,6 +165,7 @@ class NetworkEnvironment:
         self.last_latency = {
             u.ue_id: u.latency_budget_ms for u in self.users
         }
+        self.demand_shaper.reset()
         for u in self.users:
             u.serving_bs = None
             u.previous_bs = None
@@ -113,8 +184,13 @@ class NetworkEnvironment:
         if actions.shape[0] != len(self.users):
             raise ValueError("Action vector length must equal number of UEs")
 
-        for u in self.users:
-            u.move(slot_duration_s=self.timestep_s)
+        demand_factors = self._next_demand_factors()
+        for idx, u in enumerate(self.users):
+            u.move(
+                area_size=self.area_size,
+                slot_duration_s=self.timestep_s,
+                demand_factor=demand_factors[idx],
+            )
         self.reset_bs()
 
         handover_events = {}
@@ -159,34 +235,48 @@ class NetworkEnvironment:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _next_demand_factors(self):
+        multipliers, event = self.demand_shaper.step()
+        self.last_demand_event = event
+        self._last_demand_factors = multipliers
+        return multipliers
+
     def _schedule_users(self, bs):
         users = bs.connected_users
         if not users:
             bs.update_load(0.0)
             return {}
-        total_rbs = max(bs.resource_blocks, 1)
         if self.scheduler_mode == "rr":
             weights = np.ones(len(users))
         else:  # proportional fairness style
             weights = np.array(
                 [1.0 / max(u.avg_throughput_mbps, 0.1) for u in users]
             )
-        weights = weights / weights.sum()
-        raw_alloc = weights * total_rbs
-        rb_alloc = np.floor(raw_alloc).astype(int)
-        remaining = total_rbs - rb_alloc.sum()
-        if remaining > 0:
-            fractional = raw_alloc - rb_alloc
-            order = np.argsort(-fractional)
-            for idx in order[:remaining]:
-                rb_alloc[idx] += 1
-        allocations = {u.ue_id: rb_alloc[i] for i, u in enumerate(users)}
+        weights = weights / max(weights.sum(), 1e-9)
+
+        def _allocate(total_rbs):
+            total_rbs = max(total_rbs, 1)
+            raw_alloc = weights * total_rbs
+            rb_alloc = np.floor(raw_alloc).astype(int)
+            remaining = total_rbs - rb_alloc.sum()
+            if remaining > 0:
+                fractional = raw_alloc - rb_alloc
+                order = np.argsort(-fractional)
+                for idx in order[:remaining]:
+                    rb_alloc[idx] += 1
+            return {u.ue_id: rb_alloc[i] for i, u in enumerate(users)}
+
+        carrier_allocations = {}
+        for carrier in bs.iter_carriers():
+            carrier_allocations[carrier.name] = _allocate(carrier.resource_blocks)
+
         total_request_rate = sum(
             u.backlog_mbits / max(self.timestep_s, 1e-6) for u in users
         )
-        load_ratio = min(total_request_rate / bs.capacity_mbps, 3.0)
+        total_capacity = sum(c.capacity_mbps for c in bs.iter_carriers())
+        load_ratio = min(total_request_rate / max(total_capacity, 1e-3), 3.0)
         bs.update_load(load_ratio)
-        return allocations
+        return carrier_allocations
 
     def _finalize_step(self, handover_events, update_history):
         throughputs = []
@@ -197,33 +287,56 @@ class NetworkEnvironment:
         per_user_metrics = {}
 
         for bs_idx, bs in enumerate(self.base_stations):
-            allocations = self._schedule_users(bs)
+            carrier_allocations = self._schedule_users(bs)
             loads.append(bs.load)
             for u in bs.connected_users:
-                alloc_rbs = allocations.get(u.ue_id, max(bs.resource_blocks // len(bs.connected_users), 1))
-                sinr_val = sinr_linear(u, bs, self.base_stations)
-                sinr_db = 10 * np.log10(sinr_val + 1e-9)
                 backlog_before = u.backlog_mbits
-                thpt, phy_rate, cqi = user_throughput_from_phy(
-                    u, bs, sinr_val, alloc_rbs, timestep_s=self.timestep_s
-                )
-                u.update_avg_throughput(thpt)
+                user_throughput = 0.0
+                sinr_samples = []
+                carrier_rates = []
+                for carrier in bs.iter_carriers():
+                    alloc_map = carrier_allocations.get(carrier.name, {})
+                    alloc_rbs = alloc_map.get(u.ue_id, 0)
+                    if alloc_rbs <= 0:
+                        continue
+                    sinr_val = sinr_linear(
+                        u, bs, self.base_stations, carrier, fading_config=self.rl_config.get("fading")
+                    )
+                    thpt, phy_rate, cqi = user_throughput_from_phy(
+                        u,
+                        carrier.bandwidth_mhz,
+                        carrier.resource_blocks,
+                        sinr_val,
+                        alloc_rbs,
+                        timestep_s=self.timestep_s,
+                    )
+                    sinr_samples.append(10 * np.log10(sinr_val + 1e-9))
+                    carrier_rates.append(
+                        {
+                            "carrier": carrier.name,
+                            "throughput_mbps": thpt,
+                            "allocated_rbs": alloc_rbs,
+                            "phy_rate_mbps": phy_rate,
+                        }
+                    )
+                    user_throughput += thpt
+                u.update_avg_throughput(user_throughput)
                 latency = estimate_latency_ms(
-                    u, thpt, backlog_before, timestep_s=self.timestep_s
+                    u, user_throughput, backlog_before, timestep_s=self.timestep_s
                 )
-                throughputs.append(thpt)
+                throughputs.append(user_throughput)
                 latencies.append(latency)
                 queue_latencies.append(backlog_before)
-                sinrs_db.append(sinr_db)
+                sinrs_db.append(
+                    float(np.mean(sinr_samples)) if sinr_samples else -np.inf
+                )
                 per_user_metrics[u.ue_id] = {
-                    "throughput": thpt,
+                    "throughput": user_throughput,
                     "latency": latency,
                     "queue_mbits": backlog_before,
                     "cell_load": bs.load,
-                    "sinr_db": sinr_db,
-                    "radio_rate": phy_rate,
-                    "cqi": cqi,
-                    "allocated_rbs": alloc_rbs,
+                    "sinr_db": float(np.mean(sinr_samples)) if sinr_samples else -np.inf,
+                    "carrier_rates": carrier_rates,
                 }
                 self.last_latency[u.ue_id] = latency
 
@@ -279,7 +392,20 @@ class NetworkEnvironment:
         handover_flag = (
             1.0 if ue.previous_bs is not None and ue.previous_bs != ue.serving_bs else 0.0
         )
-        state = [demand_norm, backlog_norm, latency_norm, slack_norm, handover_flag]
+        max_speed = cfg.get("max_ue_speed_m_s", 20.0)
+        speed_norm = np.clip(
+            getattr(ue, "velocity_m_s", 0.0) / max(max_speed, 1e-3), 0.0, 1.0
+        )
+        heading_norm = (getattr(ue, "heading_deg", 0.0) % 360.0) / 360.0
+        state = [
+            demand_norm,
+            backlog_norm,
+            latency_norm,
+            slack_norm,
+            handover_flag,
+            speed_norm,
+            heading_norm,
+        ]
 
         for bs_id in candidate_ids:
             bs = self.base_stations[bs_id]
