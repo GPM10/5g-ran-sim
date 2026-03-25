@@ -1,5 +1,11 @@
-﻿import numpy as np
-from utils import (
+﻿import time
+
+import numpy as np
+from .core import CoreNetwork
+from .cu_du import DistributedUnit, build_cu_du_hierarchy, build_radio_units
+from .interfaces import F1Interface, F1UPlanePacket, InterfaceLink
+from .utils import (
+    DEFAULT_TELEMETRY_COLLECTOR,
     estimate_latency_ms,
     signal_strength,
     sinr_linear,
@@ -80,16 +86,27 @@ class DemandShaper:
 
 
 class NetworkEnvironment:
-    def __init__(self, base_stations, users, rl_config=None):
+    def __init__(
+        self,
+        base_stations,
+        users,
+        rl_config=None,
+        telemetry=None,
+        distributed_units=None,
+        central_units=None,
+        core_network=None,
+    ):
         self.base_stations = base_stations
         self.users = users
         self.rl_config = DEFAULT_RL_CONFIG | (rl_config or {})
+        self.telemetry = telemetry if telemetry is not None else DEFAULT_TELEMETRY_COLLECTOR
         self.timestep_s = self.rl_config.get("timestep_s", 1.0)
         self.scheduler_mode = self.rl_config.get("scheduler_mode", "pf")
         self.history = self._blank_history()
         self.prev_loads = np.zeros(len(self.base_stations), dtype=np.float32)
         self.last_latency = {u.ue_id: u.latency_budget_ms for u in self.users}
         self._last_candidate_map = None
+        self._users_by_id = {u.ue_id: u for u in self.users}
         self.area_size = int(
             max(
                 self.rl_config.get("area_size", 120),
@@ -102,6 +119,19 @@ class NetworkEnvironment:
         )
         self.last_demand_event = None
         self._last_demand_factors = np.ones(len(self.users), dtype=np.float32)
+        self.core_network = core_network if core_network is not None else CoreNetwork()
+        if self.telemetry and self.core_network:
+            self.core_network.attach_telemetry(self.telemetry)
+        if distributed_units is None or central_units is None:
+            self.distributed_units, self.central_units = build_cu_du_hierarchy(
+                self.base_stations, num_cus=max(1, self.rl_config.get("cu_count", 2))
+            )
+        else:
+            self.distributed_units = distributed_units
+            self.central_units = central_units
+        self.radio_units = build_radio_units(self.distributed_units)
+        self.f1_interfaces, self._bs_to_du = self._build_f1_interfaces(self.distributed_units)
+        self._last_f1_stats = {du.du_id: {"control_packets": 0, "user_packets": 0, "control_queue": 0, "user_queue": 0} for du in self.distributed_units}
 
     def _blank_history(self):
         return {
@@ -120,6 +150,35 @@ class NetworkEnvironment:
     def reset_bs(self):
         for bs in self.base_stations:
             bs.reset()
+        for f1 in self.f1_interfaces.values():
+            f1.control._queue.clear()
+            f1.user._queue.clear()
+        for du_id in self._last_f1_stats:
+            self._last_f1_stats[du_id] = {"control_packets": 0, "user_packets": 0, "control_queue": 0, "user_queue": 0}
+
+    def _build_f1_interfaces(self, distributed_units: List[DistributedUnit]):
+        f1_map = {}
+        bs_to_du = {}
+        for du in distributed_units:
+            control_link = InterfaceLink(
+                f"F1C-{du.du_id}",
+                latency_ms=du.fronthaul_latency_ms * 1.2,
+                jitter_ms=0.2,
+                drop_rate=0.005,
+            )
+            user_link = InterfaceLink(
+                f"F1U-{du.du_id}",
+                latency_ms=du.fronthaul_latency_ms,
+                jitter_ms=0.1,
+                drop_rate=0.002,
+                bandwidth_mbps=du.fronthaul_capacity_gbps * 1000.0,
+            )
+            f1_map[du.du_id] = F1Interface(
+                name=du.du_id, control_link=control_link, user_link=user_link
+            )
+            for bs in du.base_stations:
+                bs_to_du[bs.bs_id] = du.du_id
+        return f1_map, bs_to_du
 
     # ------------------------------------------------------------------
     # Classic heuristic-driven step/run
@@ -127,6 +186,7 @@ class NetworkEnvironment:
     def step(self, association_policy):
         handover_events = {}
         demand_factors = self._next_demand_factors()
+        self._ensure_core_sessions()
         for idx, u in enumerate(self.users):
             u.move(
                 area_size=self.area_size,
@@ -136,16 +196,17 @@ class NetworkEnvironment:
 
         self.reset_bs()
 
-        for u in self.users:
-            previous_bs = u.serving_bs
-            selected_bs = association_policy(u, self.base_stations)
-            if previous_bs is not None and previous_bs != selected_bs.bs_id:
-                handover_events[u.ue_id] = 1
-            else:
-                handover_events[u.ue_id] = 0
-            u.previous_bs = previous_bs
-            u.serving_bs = selected_bs.bs_id
-            selected_bs.add_user(u)
+            for u in self.users:
+                previous_bs = u.serving_bs
+                selected_bs = association_policy(u, self.base_stations)
+                if previous_bs is not None and previous_bs != selected_bs.bs_id:
+                    handover_events[u.ue_id] = 1
+                else:
+                    handover_events[u.ue_id] = 0
+                u.previous_bs = previous_bs
+                u.serving_bs = selected_bs.bs_id
+                selected_bs.add_user(u)
+                self._enqueue_f1_control(u, previous_bs, selected_bs.bs_id)
 
         self._finalize_step(handover_events, update_history=True)
 
@@ -192,6 +253,7 @@ class NetworkEnvironment:
                 demand_factor=demand_factors[idx],
             )
         self.reset_bs()
+        self._ensure_core_sessions()
 
         handover_events = {}
         for idx, u in enumerate(self.users):
@@ -209,6 +271,7 @@ class NetworkEnvironment:
             u.previous_bs = previous_bs
             u.serving_bs = target_bs_id
             selected_bs.add_user(u)
+            self._enqueue_f1_control(u, previous_bs, target_bs_id)
 
         per_user_metrics = self._finalize_step(
             handover_events, update_history=update_history
@@ -285,6 +348,7 @@ class NetworkEnvironment:
         queue_latencies = []
         sinrs_db = []
         per_user_metrics = {}
+        bs_throughput = {}
 
         for bs_idx, bs in enumerate(self.base_stations):
             carrier_allocations = self._schedule_users(bs)
@@ -330,6 +394,7 @@ class NetworkEnvironment:
                 sinrs_db.append(
                     float(np.mean(sinr_samples)) if sinr_samples else -np.inf
                 )
+                bs_throughput[bs.bs_id] = bs_throughput.get(bs.bs_id, 0.0) + user_throughput
                 per_user_metrics[u.ue_id] = {
                     "throughput": user_throughput,
                     "latency": latency,
@@ -339,6 +404,7 @@ class NetworkEnvironment:
                     "carrier_rates": carrier_rates,
                 }
                 self.last_latency[u.ue_id] = latency
+                self._send_f1_user_packet(bs.bs_id, u, user_throughput, latency)
 
         if loads:
             self.prev_loads = np.array(loads, dtype=np.float32)
@@ -361,6 +427,17 @@ class NetworkEnvironment:
             self.history["handover_count"].append(int(total_handovers))
             self.history["avg_sinr_db"].append(
                 float(np.mean(sinrs_db)) if sinrs_db else -np.inf
+            )
+
+        if self.telemetry:
+            self._emit_kpis(
+                loads=loads,
+                throughputs=throughputs,
+                latencies=latencies,
+                queue_latencies=queue_latencies,
+                handover_events=handover_events,
+                per_user_metrics=per_user_metrics,
+                bs_throughput=bs_throughput,
             )
 
         return per_user_metrics
@@ -467,3 +544,231 @@ class NetworkEnvironment:
             )
             rewards.append(float(reward))
         return np.array(rewards, dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Telemetry helpers
+    # ------------------------------------------------------------------
+    def set_telemetry_exporters(self, exporters):
+        if self.telemetry:
+            self.telemetry.set_exporters(exporters)
+
+    def _emit_kpis(
+        self,
+        loads,
+        throughputs,
+        latencies,
+        queue_latencies,
+        handover_events,
+        per_user_metrics,
+        bs_throughput,
+    ):
+        timestamp = time.time()
+        self._service_f1_interfaces()
+        total_bs = len(self.base_stations)
+        for bs in self.base_stations:
+            self.telemetry.emit(
+                "radio.cell_load_ratio",
+                float(bs.load),
+                labels={"bs_id": bs.bs_id, "tier": bs.tier},
+                timestamp=timestamp,
+            )
+        if self.radio_units:
+            for ru in self.radio_units:
+                util = ru.update_metrics()
+                labels = ru.telemetry_labels()
+                self.telemetry.emit(
+                    "radio.ru_load_ratio",
+                    float(util),
+                    labels=labels,
+                    timestamp=timestamp,
+                )
+                self.telemetry.emit(
+                    "radio.ru_temperature_c",
+                    float(ru.temperature_c),
+                    labels=labels,
+                    timestamp=timestamp,
+                )
+
+        avg_throughput = float(np.mean(throughputs)) if throughputs else 0.0
+        avg_latency = float(np.mean(latencies)) if latencies else 0.0
+        avg_queue = float(np.mean(queue_latencies)) if queue_latencies else 0.0
+        overloaded_cells = sum(1 for load in loads if load >= 1.0)
+
+        self.telemetry.emit(
+            "network.avg_throughput_mbps",
+            avg_throughput,
+            labels={"scope": "network"},
+            timestamp=timestamp,
+        )
+        self.telemetry.emit(
+            "network.avg_latency_ms",
+            avg_latency,
+            labels={"scope": "network"},
+            timestamp=timestamp,
+        )
+        self.telemetry.emit(
+            "network.queue_backlog_mbits",
+            avg_queue,
+            labels={"scope": "network"},
+            timestamp=timestamp,
+        )
+        self.telemetry.emit(
+            "network.overloaded_cells",
+            float(overloaded_cells),
+            labels={"scope": "network", "total_bs": total_bs},
+            timestamp=timestamp,
+        )
+
+        attempts = int(sum(handover_events.values()))
+        successes = self._estimate_handover_success(handover_events, per_user_metrics)
+        failures = max(attempts - successes, 0)
+        success_ratio = successes / attempts if attempts > 0 else 1.0
+
+        self.telemetry.emit(
+            "mobility.handover_attempts_total",
+            float(attempts),
+            labels={"scope": "network"},
+            timestamp=timestamp,
+        )
+        self.telemetry.emit(
+            "mobility.handover_failure_total",
+            float(failures),
+            labels={"scope": "network"},
+            timestamp=timestamp,
+        )
+        self.telemetry.emit(
+            "mobility.handover_success_ratio",
+            float(success_ratio),
+            labels={"scope": "network"},
+            timestamp=timestamp,
+        )
+
+        if self.distributed_units:
+            for du in self.distributed_units:
+                du.update_load(bs_throughput)
+                du_labels = du.telemetry_labels()
+                self.telemetry.emit(
+                    "core.du_processing_utilization",
+                    float(du.utilization),
+                    labels=du_labels,
+                    timestamp=timestamp,
+                )
+                self.telemetry.emit(
+                    "core.du_fronthaul_utilization",
+                    float(du.fronthaul_utilization),
+                    labels=du_labels,
+                    timestamp=timestamp,
+                )
+                stats = self._last_f1_stats.get(du.du_id, {})
+                f1 = self.f1_interfaces.get(du.du_id)
+                if f1:
+                    self.telemetry.emit(
+                        "interface.f1_control_queue",
+                        float(stats.get("control_queue", f1.control.queue_depth())),
+                        labels={"du_id": du.du_id, "cu_id": du.cu_id},
+                        timestamp=timestamp,
+                    )
+                    self.telemetry.emit(
+                        "interface.f1_user_queue",
+                        float(stats.get("user_queue", f1.user.queue_depth())),
+                        labels={"du_id": du.du_id, "cu_id": du.cu_id},
+                        timestamp=timestamp,
+                    )
+                    self.telemetry.emit(
+                        "interface.f1_control_packets",
+                        float(stats.get("control_packets", 0)),
+                        labels={"du_id": du.du_id},
+                        timestamp=timestamp,
+                    )
+                    self.telemetry.emit(
+                        "interface.f1_user_packets",
+                        float(stats.get("user_packets", 0)),
+                        labels={"du_id": du.du_id},
+                        timestamp=timestamp,
+                    )
+
+        if self.central_units:
+            for cu in self.central_units:
+                util = cu.update_utilization()
+                self.telemetry.emit(
+                    "core.cu_cpu_utilization",
+                    float(util),
+                    labels=cu.telemetry_labels(),
+                    timestamp=timestamp,
+                )
+
+        if self.core_network:
+            per_user_throughput = {
+                ue_id: metrics.get("throughput", 0.0)
+                for ue_id, metrics in per_user_metrics.items()
+            }
+            self.core_network.update_traffic(per_user_throughput)
+            self.core_network.service_interfaces()
+            self.core_network.emit_metrics(timestamp)
+
+    def _estimate_handover_success(self, handover_events, per_user_metrics):
+        successes = 0
+        for ue_id, occurred in handover_events.items():
+            if not occurred:
+                continue
+            metrics = per_user_metrics.get(ue_id)
+            ue = self._users_by_id.get(ue_id)
+            if not metrics or ue is None:
+                continue
+            load_ok = metrics.get("cell_load", 0.0) <= 1.2
+            latency_ok = metrics.get("latency", np.inf) <= ue.latency_budget_ms * 1.2
+            if load_ok and latency_ok:
+                successes += 1
+        return successes
+
+    def _ensure_core_sessions(self):
+        if not self.core_network:
+            return
+        for u in self.users:
+            slice_id = getattr(u, "traffic_profile", "embb")
+            qos_profile = "latency" if u.latency_budget_ms <= 20 else "default"
+            self.core_network.ensure_session(u.ue_id, slice_id, qos_profile)
+
+    def _enqueue_f1_control(self, ue, previous_bs_id, new_bs_id):
+        if previous_bs_id == new_bs_id:
+            return
+        du_id = self._bs_to_du.get(new_bs_id)
+        if not du_id:
+            return
+        interface = self.f1_interfaces.get(du_id)
+        if not interface:
+            return
+        payload = {
+            "ue_id": ue.ue_id,
+            "from_bs": previous_bs_id,
+            "to_bs": new_bs_id,
+            "timestamp": time.time(),
+        }
+        interface.send_control(payload)
+
+    def _send_f1_user_packet(self, bs_id, ue, throughput_mbps, latency_ms):
+        du_id = self._bs_to_du.get(bs_id)
+        if not du_id:
+            return
+        interface = self.f1_interfaces.get(du_id)
+        if not interface:
+            return
+        packet = F1UPlanePacket(
+            ue_id=ue.ue_id,
+            throughput_mbps=throughput_mbps,
+            latency_ms=latency_ms,
+        )
+        interface.send_user_plane(packet)
+
+    def _service_f1_interfaces(self):
+        if not self.f1_interfaces:
+            return
+        for du_id, interface in self.f1_interfaces.items():
+            deliveries = interface.poll()
+            stats = {
+                "control_packets": len(deliveries.get("control", [])),
+                "user_packets": len(deliveries.get("user", [])),
+                "control_queue": interface.control.queue_depth(),
+                "user_queue": interface.user.queue_depth(),
+            }
+            self._last_f1_stats[du_id] = stats

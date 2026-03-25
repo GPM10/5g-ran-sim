@@ -8,7 +8,7 @@ import httpx
 import numpy as np
 import torch
 
-from rl_models import QNetwork
+from .rl_models import QNetwork
 
 
 DEFAULT_API_BASE = os.environ.get("API_BASE", "http://127.0.0.1:8000")

@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from models import BaseStation, UserEquipment
+from .models import BaseStation, UserEquipment
 
 
 @dataclass

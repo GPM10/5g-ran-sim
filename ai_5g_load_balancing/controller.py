@@ -1,6 +1,6 @@
 import math
 
-from utils import link_distance, signal_strength
+from .utils import link_distance, signal_strength
 
 
 def strongest_signal_policy(ue, base_stations):

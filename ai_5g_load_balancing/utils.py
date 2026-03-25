@@ -1,4 +1,14 @@
+import logging
+import time
+import threading
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, Sequence, Tuple
+
 import numpy as np
+
+
+logger = logging.getLogger(__name__)
 
 NOISE_FLOOR_DBM = -104  # thermal noise reference
 
@@ -300,3 +310,485 @@ def estimate_latency_ms(ue, throughput_mbps, backlog_before_mbits, timestep_s=1.
     wait_seconds = backlog_before_mbits / max(throughput_mbps, 1e-3)
     latency = min(wait_seconds * 1000.0, ue.latency_budget_ms * 5)
     return latency
+
+
+# ---------------------------------------------------------------------------
+# Telemetry & Monitoring infrastructure
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TelemetryThreshold:
+    warn: Optional[float] = None
+    crit: Optional[float] = None
+    comparison: str = "gte"  # "gte" or "lte"
+
+    def evaluate(self, value: float) -> Optional[str]:
+        if self.warn is None and self.crit is None:
+            return None
+        if self.comparison == "gte":
+            if self.crit is not None and value >= self.crit:
+                return "critical"
+            if self.warn is not None and value >= self.warn:
+                return "warning"
+        else:
+            if self.crit is not None and value <= self.crit:
+                return "critical"
+            if self.warn is not None and value <= self.warn:
+                return "warning"
+        return None
+
+
+@dataclass
+class MetricSample:
+    value: float
+    labels: Dict[str, Any]
+    timestamp: float
+
+
+@dataclass
+class TelemetryMetric:
+    name: str
+    description: str
+    metric_type: str = "gauge"  # gauge | counter
+    unit: str = ""
+    thresholds: Optional[TelemetryThreshold] = None
+    history_size: int = 180
+    history: deque = field(
+        default_factory=lambda: deque(maxlen=180)
+    )  # sliding window for dashboards
+
+    def add_sample(self, sample: MetricSample):
+        self.history.append(sample)
+
+    def latest_value(self) -> Optional[MetricSample]:
+        return self.history[-1] if self.history else None
+
+    def check_threshold(self, sample: MetricSample) -> Optional[str]:
+        if self.thresholds is None:
+            return None
+        return self.thresholds.evaluate(sample.value)
+
+
+class TelemetryExporter:
+    def emit(
+        self, metric: TelemetryMetric, sample: MetricSample, severity: Optional[str]
+    ):
+        raise NotImplementedError
+
+
+class PrometheusExporter(TelemetryExporter):
+    def __init__(self, port: int = 9102, namespace: str = "ai5g", start_server: bool = True):
+        try:
+            from prometheus_client import CollectorRegistry, Counter, Gauge, start_http_server
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "prometheus_client is required for PrometheusExporter"
+            ) from exc
+        self._Counter = Counter
+        self._Gauge = Gauge
+        self.registry = CollectorRegistry()
+        self.namespace = namespace
+        self.metrics: Dict[Tuple[str, Tuple[str, ...]], Any] = {}
+        if start_server:
+            start_http_server(port, registry=self.registry)
+
+    def _metric_key(self, metric: TelemetryMetric, labels: Dict[str, Any]):
+        label_names = tuple(sorted(labels.keys()))
+        return (metric.name, label_names)
+
+    def _resolve_metric(self, metric: TelemetryMetric, labels: Dict[str, Any]):
+        key = self._metric_key(metric, labels)
+        if key not in self.metrics:
+            label_names = key[1]
+            params = {
+                "name": metric.name.replace(".", "_"),
+                "documentation": metric.description,
+                "labelnames": label_names,
+                "registry": self.registry,
+                "namespace": self.namespace,
+                "unit": metric.unit or None,
+            }
+            if metric.metric_type == "counter":
+                self.metrics[key] = self._Counter(**params)
+            else:
+                self.metrics[key] = self._Gauge(**params)
+        label_names = key[1]
+        prom_metric = self.metrics[key]
+        if not label_names:
+            return prom_metric
+        label_values = [labels[name] for name in label_names]
+        return prom_metric.labels(*label_values)
+
+    def emit(self, metric: TelemetryMetric, sample: MetricSample, severity: Optional[str]):
+        prom_metric = self._resolve_metric(metric, sample.labels)
+        if metric.metric_type == "counter":
+            prom_metric.inc(sample.value)
+        else:
+            prom_metric.set(sample.value)
+
+
+class OTLPExporter(TelemetryExporter):
+    def __init__(
+        self,
+        endpoint: str,
+        headers: Optional[Dict[str, str]] = None,
+        timeout_s: float = 2.0,
+        raise_on_error: bool = False,
+    ):
+        import urllib.request
+
+        self.endpoint = endpoint
+        self.headers = headers or {"Content-Type": "application/json"}
+        self.timeout_s = timeout_s
+        self.raise_on_error = raise_on_error
+        self._urllib = urllib.request
+
+    def emit(self, metric: TelemetryMetric, sample: MetricSample, severity: Optional[str]):
+        import json
+
+        payload = {
+            "resource_metrics": [
+                {
+                    "resource": {"attributes": [{"key": "service.name", "value": "ai5g-controller"}]},
+                    "scope_metrics": [
+                        {
+                            "metrics": [
+                                {
+                                    "name": metric.name,
+                                    "description": metric.description,
+                                    "unit": metric.unit,
+                                    "type": metric.metric_type,
+                                    "value": sample.value,
+                                    "labels": sample.labels,
+                                    "timestamp": sample.timestamp,
+                                    "severity": severity,
+                                }
+                            ]
+                        }
+                    ],
+                }
+            ]
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = self._urllib.Request(self.endpoint, data=data, headers=self.headers, method="POST")
+        try:
+            self._urllib.urlopen(req, timeout=self.timeout_s)
+        except Exception as exc:  # pragma: no cover - network errors
+            logger.debug("OTLP export failed for %s: %s", metric.name, exc)
+            if self.raise_on_error:
+                raise
+
+
+class TelemetryCollector:
+    def __init__(self):
+        self.metrics: Dict[str, TelemetryMetric] = {}
+        self.exporters: Sequence[TelemetryExporter] = ()
+        self._lock = threading.Lock()
+
+    def set_exporters(self, exporters: Sequence[TelemetryExporter]):
+        self.exporters = exporters
+
+    def register_metric(
+        self,
+        name: str,
+        description: str,
+        metric_type: str = "gauge",
+        unit: str = "",
+        thresholds: Optional[TelemetryThreshold] = None,
+        history_size: int = 180,
+    ) -> TelemetryMetric:
+        with self._lock:
+            metric = self.metrics.get(name)
+            if metric:
+                return metric
+            metric = TelemetryMetric(
+                name=name,
+                description=description,
+                metric_type=metric_type,
+                unit=unit,
+                thresholds=thresholds,
+                history_size=history_size,
+                history=deque(maxlen=history_size),
+            )
+            self.metrics[name] = metric
+            return metric
+
+    def emit(
+        self, name: str, value: float, labels: Optional[Dict[str, Any]] = None, timestamp: Optional[float] = None
+    ) -> Optional[str]:
+        with self._lock:
+            metric = self.metrics.get(name)
+            if metric is None:
+                metric = self.register_metric(name, description=name)
+        sample = MetricSample(
+            value=float(value),
+            labels=labels or {},
+            timestamp=timestamp if timestamp is not None else time.time(),
+        )
+        metric.add_sample(sample)
+        severity = metric.check_threshold(sample)
+        for exporter in self.exporters:
+            try:
+                exporter.emit(metric, sample, severity)
+            except Exception as exc:  # pragma: no cover - exporter errors
+                logger.debug("Telemetry exporter %s failed: %s", exporter.__class__.__name__, exc)
+        return severity
+
+    def snapshot(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            snapshot = {}
+            for name, metric in self.metrics.items():
+                latest = metric.latest_value()
+                snapshot[name] = {
+                    "description": metric.description,
+                    "unit": metric.unit,
+                    "metric_type": metric.metric_type,
+                    "latest": {
+                        "value": latest.value if latest else None,
+                        "labels": latest.labels if latest else {},
+                        "timestamp": latest.timestamp if latest else None,
+                    },
+                }
+        return snapshot
+
+
+DEFAULT_ALERT_THRESHOLDS = {
+    "radio.cell_load_ratio": TelemetryThreshold(warn=1.0, crit=1.2, comparison="gte"),
+    "radio.ru_load_ratio": TelemetryThreshold(warn=1.0, crit=1.3, comparison="gte"),
+    "radio.ru_temperature_c": TelemetryThreshold(warn=70.0, crit=85.0, comparison="gte"),
+    "network.avg_throughput_mbps": TelemetryThreshold(warn=8.0, crit=6.0, comparison="lte"),
+    "network.avg_latency_ms": TelemetryThreshold(warn=120.0, crit=160.0, comparison="gte"),
+    "network.queue_backlog_mbits": TelemetryThreshold(warn=8.0, crit=12.0, comparison="gte"),
+    "mobility.handover_success_ratio": TelemetryThreshold(warn=0.85, crit=0.7, comparison="lte"),
+    "core.du_processing_utilization": TelemetryThreshold(warn=0.8, crit=1.0, comparison="gte"),
+    "core.du_fronthaul_utilization": TelemetryThreshold(warn=0.8, crit=1.0, comparison="gte"),
+    "core.cu_cpu_utilization": TelemetryThreshold(warn=0.75, crit=0.95, comparison="gte"),
+    "core.upf_load_ratio": TelemetryThreshold(warn=0.8, crit=1.0, comparison="gte"),
+}
+
+
+def _bootstrap_default_collector() -> TelemetryCollector:
+    collector = TelemetryCollector()
+    collector.register_metric(
+        "radio.cell_load_ratio",
+        "Current load ratio per base station",
+        metric_type="gauge",
+        unit="ratio",
+        thresholds=DEFAULT_ALERT_THRESHOLDS["radio.cell_load_ratio"],
+    )
+    collector.register_metric(
+        "radio.ru_load_ratio",
+        "Radio Unit load ratio",
+        metric_type="gauge",
+        unit="ratio",
+        thresholds=DEFAULT_ALERT_THRESHOLDS["radio.ru_load_ratio"],
+    )
+    collector.register_metric(
+        "radio.ru_temperature_c",
+        "Radio Unit temperature (C)",
+        metric_type="gauge",
+        unit="celsius",
+        thresholds=DEFAULT_ALERT_THRESHOLDS["radio.ru_temperature_c"],
+    )
+    collector.register_metric(
+        "network.avg_throughput_mbps",
+        "Average UE throughput (Mbps)",
+        metric_type="gauge",
+        unit="mbps",
+        thresholds=DEFAULT_ALERT_THRESHOLDS["network.avg_throughput_mbps"],
+    )
+    collector.register_metric(
+        "network.avg_latency_ms",
+        "Average UE latency (ms)",
+        metric_type="gauge",
+        unit="ms",
+        thresholds=DEFAULT_ALERT_THRESHOLDS["network.avg_latency_ms"],
+    )
+    collector.register_metric(
+        "network.queue_backlog_mbits",
+        "Average UE queue backlog (Mbits)",
+        metric_type="gauge",
+        unit="mbits",
+        thresholds=DEFAULT_ALERT_THRESHOLDS["network.queue_backlog_mbits"],
+    )
+    collector.register_metric(
+        "mobility.handover_attempts_total",
+        "Number of handover attempts in the latest step",
+        metric_type="counter",
+        unit="events",
+    )
+    collector.register_metric(
+        "mobility.handover_success_ratio",
+        "Ratio of successful handovers per step",
+        metric_type="gauge",
+        unit="ratio",
+        thresholds=DEFAULT_ALERT_THRESHOLDS["mobility.handover_success_ratio"],
+    )
+    collector.register_metric(
+        "mobility.handover_failure_total",
+        "Handover failures detected per step",
+        metric_type="counter",
+        unit="events",
+    )
+    collector.register_metric(
+        "network.overloaded_cells",
+        "Number of base stations operating above safe load",
+        metric_type="gauge",
+        unit="count",
+    )
+    collector.register_metric(
+        "core.du_processing_utilization",
+        "DU processing utilization ratio",
+        metric_type="gauge",
+        unit="ratio",
+        thresholds=DEFAULT_ALERT_THRESHOLDS["core.du_processing_utilization"],
+    )
+    collector.register_metric(
+        "core.du_fronthaul_utilization",
+        "DU fronthaul utilization ratio",
+        metric_type="gauge",
+        unit="ratio",
+        thresholds=DEFAULT_ALERT_THRESHOLDS["core.du_fronthaul_utilization"],
+    )
+    collector.register_metric(
+        "core.cu_cpu_utilization",
+        "CU processing utilization ratio",
+        metric_type="gauge",
+        unit="ratio",
+        thresholds=DEFAULT_ALERT_THRESHOLDS["core.cu_cpu_utilization"],
+    )
+    collector.register_metric(
+        "core.upf_throughput_gbps",
+        "UPF throughput (Gbps)",
+        metric_type="gauge",
+        unit="gbps",
+    )
+    collector.register_metric(
+        "core.upf_load_ratio",
+        "UPF load ratio",
+        metric_type="gauge",
+        unit="ratio",
+        thresholds=DEFAULT_ALERT_THRESHOLDS["core.upf_load_ratio"],
+    )
+    collector.register_metric(
+        "core.amf_registered_users",
+        "Registered subscribers in AMF",
+        metric_type="gauge",
+        unit="count",
+    )
+    collector.register_metric(
+        "core.smf_active_sessions",
+        "Active sessions handled by SMF",
+        metric_type="gauge",
+        unit="count",
+    )
+    collector.register_metric(
+        "interface.f1_control_queue",
+        "F1 control-plane queue depth",
+        metric_type="gauge",
+        unit="packets",
+    )
+    collector.register_metric(
+        "interface.f1_user_queue",
+        "F1 user-plane queue depth",
+        metric_type="gauge",
+        unit="packets",
+    )
+    collector.register_metric(
+        "interface.f1_control_packets",
+        "Delivered F1 control packets per step",
+        metric_type="gauge",
+        unit="packets",
+    )
+    collector.register_metric(
+        "interface.f1_user_packets",
+        "Delivered F1 user-plane packets per step",
+        metric_type="gauge",
+        unit="packets",
+    )
+    collector.register_metric(
+        "interface.n2_queue",
+        "N2 interface queue depth",
+        metric_type="gauge",
+        unit="messages",
+    )
+    collector.register_metric(
+        "interface.n3_queue",
+        "N3 interface queue depth",
+        metric_type="gauge",
+        unit="messages",
+    )
+    collector.register_metric(
+        "interface.n2_messages",
+        "Delivered N2 signaling messages per step",
+        metric_type="gauge",
+        unit="messages",
+    )
+    collector.register_metric(
+        "interface.n3_reports",
+        "Delivered N3 flow reports per step",
+        metric_type="gauge",
+        unit="messages",
+    )
+    return collector
+
+
+DEFAULT_TELEMETRY_COLLECTOR = _bootstrap_default_collector()
+
+
+def get_dashboard_spec() -> Dict[str, Any]:
+    """Return a minimal dashboard configuration consumers can render."""
+    return {
+        "title": "AI 5G Load-balancing KPIs",
+        "panels": [
+            {
+                "title": "Avg Throughput (Mbps)",
+                "metric": "network.avg_throughput_mbps",
+                "thresholds": {"warning": 8.0, "critical": 6.0},
+            },
+            {
+                "title": "Avg Latency (ms)",
+                "metric": "network.avg_latency_ms",
+                "thresholds": {"warning": 120.0, "critical": 160.0},
+            },
+            {
+                "title": "Cell Load Heatmap",
+                "metric": "radio.cell_load_ratio",
+                "thresholds": {"warning": 1.0, "critical": 1.2},
+                "breakdown": "bs_id",
+            },
+            {
+                "title": "Handover Success",
+                "metric": "mobility.handover_success_ratio",
+                "thresholds": {"warning": 0.85, "critical": 0.7},
+            },
+            {
+                "title": "Queue Backlog",
+                "metric": "network.queue_backlog_mbits",
+                "thresholds": {"warning": 8.0, "critical": 12.0},
+            },
+        ],
+        "alerts": [
+            {
+                "name": "Cell Overload",
+                "condition": "radio.cell_load_ratio >= 1.2 for 2m",
+                "severity": "critical",
+            },
+            {
+                "name": "Throughput Regression",
+                "condition": "network.avg_throughput_mbps <= 6.0 for 5m",
+                "severity": "critical",
+            },
+            {
+                "name": "Latency Spike",
+                "condition": "network.avg_latency_ms >= 160 for 3m",
+                "severity": "warning",
+            },
+            {
+                "name": "Handover Failures",
+                "condition": "mobility.handover_success_ratio <= 0.7 for 1m",
+                "severity": "critical",
+            },
+        ],
+    }

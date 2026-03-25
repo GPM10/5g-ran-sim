@@ -2,10 +2,11 @@ import argparse
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from controller import load_aware_policy, strongest_signal_policy
-from environment import NetworkEnvironment
-from rl_models import QNetwork
-from topology import build_network_from_spec, build_reference_network, load_topology_spec
+from .controller import load_aware_policy, strongest_signal_policy
+from .environment import NetworkEnvironment
+from .rl_models import QNetwork
+from .topology import build_network_from_spec, build_reference_network, load_topology_spec
+from .utils import DEFAULT_TELEMETRY_COLLECTOR, OTLPExporter, PrometheusExporter
 
 
 class DQNInferenceAgent:
@@ -143,11 +144,64 @@ def parse_args():
         default=None,
         help="Path to a JSON topology spec (defaults to built-in macro/micro)",
     )
+    parser.add_argument(
+        "--metrics-exporter",
+        choices=["prometheus", "otlp", "none"],
+        default="prometheus",
+        help="Telemetry exporter to enable (default: prometheus)",
+    )
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=9102,
+        help="Port for the Prometheus metrics endpoint",
+    )
+    parser.add_argument(
+        "--otlp-endpoint",
+        type=str,
+        default=None,
+        help="OTLP/HTTP endpoint URL for telemetry (required if --metrics-exporter=otlp)",
+    )
+    parser.add_argument(
+        "--otlp-header",
+        action="append",
+        default=[],
+        metavar="KEY:VALUE",
+        help="Additional OTLP HTTP header (can be repeated)",
+    )
     return parser.parse_args()
+
+
+def _parse_headers(header_list):
+    headers = {}
+    for header in header_list:
+        if ":" not in header:
+            raise ValueError(f"Invalid header '{header}', expected KEY:VALUE")
+        key, value = header.split(":", 1)
+        headers[key.strip()] = value.strip()
+    return headers
+
+
+def configure_metrics(args):
+    exporter = None
+    if args.metrics_exporter == "prometheus":
+        exporter = PrometheusExporter(port=args.metrics_port, namespace="ai5g")
+    elif args.metrics_exporter == "otlp":
+        if not args.otlp_endpoint:
+            raise ValueError("OTLP endpoint is required when metrics exporter is set to 'otlp'")
+        headers = _parse_headers(args.otlp_header)
+        exporter = OTLPExporter(endpoint=args.otlp_endpoint, headers=headers or None)
+
+    if exporter:
+        DEFAULT_TELEMETRY_COLLECTOR.set_exporters((exporter,))
 
 
 def main():
     args = parse_args()
+    try:
+        configure_metrics(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     steps = args.steps
 
     bs1, users1 = build_network(args.topology)

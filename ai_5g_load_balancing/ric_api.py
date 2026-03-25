@@ -1,18 +1,20 @@
 import logging
 import os
 import time
+from collections import deque
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from controller import predictive_mobility_policy
-from environment import NetworkEnvironment
-from topology import (
+from .controller import predictive_mobility_policy
+from .environment import NetworkEnvironment
+from .interfaces import E2ControlMessage, E2Interface, E2KpmReport
+from .topology import (
     build_network_from_spec,
     build_reference_network,
     load_topology_spec,
@@ -57,12 +59,15 @@ class SimulationManager:
     def __init__(self, topology_path: Optional[str] = None):
         base_stations, users = self._load_topology(topology_path)
         self.env = NetworkEnvironment(base_stations, users)
+        self.e2 = E2Interface()
+        self.e2.add_subscription("default-kpm", {"interval_ms": 200})
         self._bs_id_to_index = {bs.bs_id: idx for idx, bs in enumerate(base_stations)}
         self.states, self.candidate_map = self.env.reset_for_rl()
         self.last_metrics: Optional[Dict[int, Dict[str, float]]] = None
         self.last_snapshot: Optional[Dict] = None
         self.last_timestamp = time.time()
         self.lock = Lock()
+        self._recent_kpm: Deque[Dict] = deque(maxlen=50)
         logger.info(
             "Simulation initialized with %d users across %d cells (topology=%s)",
             len(self.env.users),
@@ -96,7 +101,6 @@ class SimulationManager:
         if not request.actions:
             logger.warning("Rejected action request: empty actions list")
             raise HTTPException(status_code=400, detail="Action list is empty")
-        mapping = {}
         for action in request.actions:
             if action.ue_id < 0 or action.ue_id >= len(self.env.users):
                 logger.warning("Rejected action: invalid ue_id=%s", action.ue_id)
@@ -106,11 +110,11 @@ class SimulationManager:
                 raise HTTPException(
                     status_code=400, detail=f"Invalid target_bs {action.target_bs}"
                 )
-            mapping[action.ue_id] = action.target_bs
+            msg = E2ControlMessage(ue_id=action.ue_id, target_bs=action.target_bs)
+            self.e2.send_control(msg)
         with self.lock:
-            action_vector = self._actions_from_mapping(mapping)
-            self._step(action_vector, source="xapp")
-            logger.info("Applied %d external actions", len(request.actions))
+            self._step(source="xapp")
+            logger.info("Queued %d external actions via E2", len(request.actions))
             return self.last_snapshot
 
     def get_history(self, tail: int = 50):
@@ -120,10 +124,40 @@ class SimulationManager:
                 history[key] = values[-tail:]
             return history
 
+    def core_state(self) -> Dict:
+        core = getattr(self.env, "core_network", None)
+        if core is None:
+            return {}
+        return {
+            "upf": {
+                "upf_id": core.upf.upf_id,
+                "throughput_gbps": core.upf.current_throughput_gbps,
+                "load_ratio": core.upf.load_ratio,
+                "capacity_gbps": core.upf.capacity_gbps,
+            },
+            "amf": {
+                "registered_users": len(core.amf.registry),
+                "active_users": core.amf.active_subscribers(),
+                "registrations": core.amf.registration_events,
+            },
+            "smf": {
+                "active_sessions": core.smf.active_sessions,
+            },
+        }
+
+    def e2_state(self) -> Dict:
+        return {
+            "control_queue_depth": self.e2.control_queue_depth(),
+            "kpm_queue_depth": self.e2.report_queue_depth(),
+            "recent_kpm_reports": list(self._recent_kpm),
+        }
+
     def _step(self, action_vector: Optional[List[int]] = None, source: Optional[str] = None):
+        self._collect_kpm_reports()
         external = action_vector is not None
         if action_vector is None:
-            action_vector = self._heuristic_actions()
+            control_mapping = self._drain_control_messages()
+            action_vector = self._actions_from_mapping(control_mapping)
         step_source = source or ("xapp" if external else "heuristic")
         states, _, info = self.env.step_with_actions(
             action_vector,
@@ -135,6 +169,9 @@ class SimulationManager:
         self.last_metrics = info["metrics"]
         self.last_timestamp = time.time()
         self.last_snapshot = self._build_snapshot()
+        self._publish_kpm_reports(
+            self.last_snapshot["cell_stats"], self.last_snapshot["aggregates"]
+        )
         aggregates = self.last_snapshot.get("aggregates", {})
         logger.info(
             "Step via %s controller | avg_latency=%.1f ms | max_load=%.2f | avg_thpt=%.2f Mbps",
@@ -161,6 +198,44 @@ class SimulationManager:
             else:
                 actions.append(fallback[idx])
         return actions
+
+    def _drain_control_messages(self) -> Dict[int, int]:
+        mapping: Dict[int, int] = {}
+        for payload in self.e2.poll_control():
+            message = payload.get("message")
+            if isinstance(message, dict):
+                message = E2ControlMessage(**message)
+            mapping[message.ue_id] = message.target_bs
+        return mapping
+
+    def _collect_kpm_reports(self):
+        for payload in self.e2.poll_kpm():
+            report = payload.get("report")
+            if isinstance(report, dict):
+                report = E2KpmReport(**report)
+            self._recent_kpm.append(
+                {
+                    "cell_id": report.cell_id,
+                    "timestamp": report.timestamp,
+                    "metrics": report.metrics,
+                }
+            )
+
+    def _publish_kpm_reports(self, cell_stats: List[Dict], aggregates: Dict):
+        for cell in cell_stats:
+            metrics = {
+                "load": cell["load"],
+                "connected_ues": cell["connected_ues"],
+                "capacity_mbps": cell["capacity_mbps"],
+                "avg_latency_ms": aggregates.get("avg_latency_ms", 0.0),
+                "avg_throughput_mbps": aggregates.get("avg_throughput_mbps", 0.0),
+            }
+            report = E2KpmReport(
+                cell_id=cell["bs_id"],
+                timestamp=self.last_timestamp,
+                metrics=metrics,
+            )
+            self.e2.publish_kpm(report)
 
     def _candidate_index(self, ue_idx: int, bs_id: int) -> int:
         candidates = self.candidate_map[ue_idx]
@@ -262,6 +337,8 @@ class SimulationManager:
             ],
             "demand_event": self.env.last_demand_event,
         }
+        snapshot["core"] = self.core_state()
+        snapshot["e2"] = self.e2_state()
         return snapshot
 
 TOPOLOGY_PATH = os.getenv("TOPOLOGY_FILE")
@@ -292,6 +369,16 @@ def actions(request: ActionRequest):
 @app.get("/history")
 def history(tail: int = 50):
     return manager.get_history(tail=tail)
+
+
+@app.get("/core")
+def core():
+    return manager.core_state()
+
+
+@app.get("/e2")
+def e2():
+    return manager.e2_state()
 
 
 if __name__ == "__main__":

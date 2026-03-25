@@ -20,9 +20,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from environment import NetworkEnvironment
-from models import BaseStation, UserEquipment
-from rl_models import QNetwork
+from .environment import NetworkEnvironment
+from .models import BaseStation, UserEquipment
+from .rl_models import QNetwork
 
 
 # ---------------------------------------------------------------------------
