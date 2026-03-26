@@ -24,6 +24,17 @@ def _transport_penalty(bs, context):
     return penalty
 
 
+def _intent_multiplier(ue, context):
+    if not context:
+        return 1.0
+    intents = context.get("intents", {})
+    intent = intents.get(getattr(ue, "traffic_profile", ""), None)
+    if not intent:
+        return 1.0
+    priority = max(intent.get("priority", 1), 1)
+    return 1.0 + 0.15 * (priority - 1)
+
+
 def strongest_signal_policy(ue, base_stations, context=None):
     return max(base_stations, key=lambda bs: signal_strength(ue, bs))
 
@@ -39,9 +50,11 @@ def load_aware_policy(ue, base_stations, context=None, alpha=0.7, beta=0.3):
     best_bs = None
     best_score = -1e9
 
+    intent_boost = _intent_multiplier(ue, context)
+
     for bs, sig in zip(base_stations, signals):
         transport_pen = _transport_penalty(bs, context)
-        score = alpha * (sig / max_sig) - beta * bs.load - 0.3 * transport_pen
+        score = intent_boost * alpha * (sig / max_sig) - beta * bs.load - 0.3 * transport_pen
         if score > best_score:
             best_score = score
             best_bs = bs
@@ -83,6 +96,8 @@ def predictive_mobility_policy(ue, base_stations, context=None, weights=None):
     best_bs = None
     best_score = float("-inf")
 
+    intent_boost = _intent_multiplier(ue, context)
+
     for bs in base_stations:
         sig_norm = signal_strength(ue, bs) / max_signal
         load_term = 1.0 - min(bs.load, cfg["load_cap"]) / cfg["load_cap"]
@@ -102,7 +117,7 @@ def predictive_mobility_policy(ue, base_stations, context=None, weights=None):
 
         penalty = _transport_penalty(bs, context)
 
-        score = (
+        score = intent_boost * (
             cfg["w_signal"] * sig_norm
             + cfg["w_load"] * load_term
             + cfg["w_capacity"] * capacity_term
@@ -110,8 +125,7 @@ def predictive_mobility_policy(ue, base_stations, context=None, weights=None):
             + cfg["w_mobility"] * mobility_term
             + cfg["w_velocity"] * velocity_term
             + cfg["w_stability"] * stability_term
-            - 0.5 * penalty
-        )
+        ) - 0.5 * penalty
         if score > best_score:
             best_score = score
             best_bs = bs

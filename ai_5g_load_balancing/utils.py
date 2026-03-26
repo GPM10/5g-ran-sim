@@ -731,6 +731,36 @@ def _bootstrap_default_collector() -> TelemetryCollector:
         metric_type="gauge",
         unit="messages",
     )
+    collector.register_metric(
+        "sdwan.intent_count",
+        "Active tenant intents affecting policies",
+        metric_type="gauge",
+        unit="count",
+    )
+    collector.register_metric(
+        "sdwan.edge_cpu_utilization",
+        "SD-WAN edge CPU/DPU utilization",
+        metric_type="gauge",
+        unit="ratio",
+    )
+    collector.register_metric(
+        "sdwan.edge_link_utilization",
+        "SD-WAN edge link utilization",
+        metric_type="gauge",
+        unit="ratio",
+    )
+    collector.register_metric(
+        "sdwan.wan_link_latency_ms",
+        "WAN link latency per path",
+        metric_type="gauge",
+        unit="ms",
+    )
+    collector.register_metric(
+        "sdwan.wan_link_utilization",
+        "WAN link utilization ratio",
+        metric_type="gauge",
+        unit="ratio",
+    )
     return collector
 
 

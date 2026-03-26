@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from .controller import predictive_mobility_policy
 from .environment import NetworkEnvironment
+from .intent_manager import IntentManager
 from .interfaces import E2ControlMessage, E2Interface, E2KpmReport
 from .topology import (
     build_network_from_spec,
@@ -55,12 +56,22 @@ class ActionRequest(BaseModel):
     actions: List[ActionItem]
 
 
+class IntentPayload(BaseModel):
+    tenant: str
+    slice_id: str
+    latency_target_ms: float
+    bandwidth_mbps: float
+    priority: int = 1
+
+
 class SimulationManager:
     def __init__(self, topology_path: Optional[str] = None):
         base_stations, users = self._load_topology(topology_path)
         self.env = NetworkEnvironment(base_stations, users)
         self.e2 = E2Interface()
         self.e2.add_subscription("default-kpm", {"interval_ms": 200})
+        self.intent_manager = IntentManager()
+        self.env.set_intents(self.intent_manager.as_policy_dict())
         self._bs_id_to_index = {bs.bs_id: idx for idx, bs in enumerate(base_stations)}
         self.states, self.candidate_map = self.env.reset_for_rl()
         self.last_metrics: Optional[Dict[int, Dict[str, float]]] = None
@@ -151,6 +162,32 @@ class SimulationManager:
             "kpm_queue_depth": self.e2.report_queue_depth(),
             "recent_kpm_reports": list(self._recent_kpm),
         }
+
+    def sync_intents(self):
+        self.env.set_intents(self.intent_manager.as_policy_dict())
+
+    def list_intents(self):
+        with self.lock:
+            return [intent.to_dict() for intent in self.intent_manager.list_intents()]
+
+    def create_intent(self, payload: IntentPayload):
+        with self.lock:
+            intent = self.intent_manager.add_intent(
+                tenant=payload.tenant,
+                slice_id=payload.slice_id,
+                latency_target_ms=payload.latency_target_ms,
+                bandwidth_mbps=payload.bandwidth_mbps,
+                priority=payload.priority,
+            )
+            self.sync_intents()
+            return intent.to_dict()
+
+    def delete_intent(self, intent_id: int) -> bool:
+        with self.lock:
+            removed = self.intent_manager.remove_intent(intent_id)
+            if removed:
+                self.sync_intents()
+            return removed
 
     def _step(self, action_vector: Optional[List[int]] = None, source: Optional[str] = None):
         self._collect_kpm_reports()
@@ -341,6 +378,7 @@ class SimulationManager:
         }
         snapshot["core"] = self.core_state()
         snapshot["e2"] = self.e2_state()
+        snapshot["intents"] = self.intent_manager.as_policy_dict()
         return snapshot
 
 TOPOLOGY_PATH = os.getenv("TOPOLOGY_FILE")
@@ -381,6 +419,24 @@ def core():
 @app.get("/e2")
 def e2():
     return manager.e2_state()
+
+
+@app.get("/intents")
+def list_intents():
+    return manager.list_intents()
+
+
+@app.post("/intents")
+def create_intent(payload: IntentPayload):
+    return manager.create_intent(payload)
+
+
+@app.delete("/intents/{intent_id}")
+def delete_intent(intent_id: int):
+    removed = manager.delete_intent(intent_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Intent not found")
+    return {"status": "removed", "intent_id": intent_id}
 
 
 if __name__ == "__main__":

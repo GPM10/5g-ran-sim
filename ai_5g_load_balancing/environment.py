@@ -1,4 +1,5 @@
 ﻿import time
+from typing import Dict
 
 import numpy as np
 from .core import CoreNetwork
@@ -134,11 +135,15 @@ class NetworkEnvironment:
         self._last_f1_stats = {}
         self._last_ru_metrics = {}
         self._last_core_interface_stats = {}
+        self._wan_context: Dict = {}
+        self._intent_state = {}
         self._policy_context = {
             "bs_to_du": self._bs_to_du,
             "f1": {},
             "ru": {},
             "core": {"upf_load": 0.0, "interface": {}},
+            "intents": {},
+            "wan": {},
         }
         self._last_f1_stats = {du.du_id: {"control_packets": 0, "user_packets": 0, "control_queue": 0, "user_queue": 0} for du in self.distributed_units}
 
@@ -171,6 +176,14 @@ class NetworkEnvironment:
     @property
     def policy_context(self):
         return self._policy_context
+
+    def set_intents(self, intents: Dict[str, Dict]):
+        self._intent_state = intents or {}
+        self._update_policy_context()
+
+    def set_wan_context(self, wan_context: Dict):
+        self._wan_context = wan_context or {}
+        self._update_policy_context()
 
     def _build_f1_interfaces(self, distributed_units: List[DistributedUnit]):
         f1_map = {}
@@ -638,6 +651,12 @@ class NetworkEnvironment:
             labels={"scope": "network", "total_bs": total_bs},
             timestamp=timestamp,
         )
+        self.telemetry.emit(
+            "sdwan.intent_count",
+            float(len(self._intent_state)),
+            labels={"scope": "global"},
+            timestamp=timestamp,
+        )
 
         attempts = int(sum(handover_events.values()))
         successes = self._estimate_handover_success(handover_events, per_user_metrics)
@@ -805,4 +824,6 @@ class NetworkEnvironment:
             "f1": dict(self._last_f1_stats),
             "ru": dict(self._last_ru_metrics),
             "core": core_context,
+            "intents": dict(self._intent_state),
+            "wan": dict(self._wan_context),
         }

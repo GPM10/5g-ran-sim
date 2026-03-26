@@ -32,6 +32,17 @@ ai_5g_load_balancing/
    ```
 3. Inspect the console summary plus five matplotlib plots (avg throughput, max load, avg latency, average queue backlog, cumulative handovers) to compare baseline vs. load-aware policies.
 
+## SD-WAN / Intent Extensions
+
+The simulator now includes optional SD-WAN orchestration, tenant intents, and multi-region runs:
+
+- `docs/sdwan_extension_plan.md` – high-level roadmap aligning the project with the NEWTON MSCA objectives.
+- `docs/sdwan_runbook.md` – operational guide showing how to launch multi-region simulations (`python -m ai_5g_load_balancing.multi_region`), submit intents via the RIC API, and visualize SD-WAN telemetry.
+- `intent_manager.py`, `sdwan_edge.py`, `sdwan_wan.py`, `sdwan_controller.py`, and `multi_region.py` implement intent storage, WAN edges/links, orchestration, and CLI experiments.
+- The FastAPI service (`ric_api.py`) exposes `GET/POST/DELETE /intents`, and policies automatically adjust based on `context["intents"]` + WAN metrics (`context["wan"]`).
+
+Refer to the runbook for reproduction steps and telemetry panels that correlate WAN behavior with RAN KPIs.
+
 ### Simulator realism knobs
 
 - **Multi-tier deployment** – macros transmit at higher power/bandwidth, micros densify hotspots. LOS/NLOS probability and path-loss parameters are tier-aware.
