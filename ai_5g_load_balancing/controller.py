@@ -3,11 +3,32 @@ import math
 from .utils import link_distance, signal_strength
 
 
-def strongest_signal_policy(ue, base_stations):
+def _transport_penalty(bs, context):
+    if not context:
+        return 0.0
+    penalty = 0.0
+    bs_to_du = context.get("bs_to_du", {})
+    du_id = bs_to_du.get(bs.bs_id)
+    if du_id:
+        stats = context.get("f1", {}).get(du_id, {})
+        user_queue = stats.get("user_queue", 0.0)
+        control_queue = stats.get("control_queue", 0.0)
+        penalty += min(user_queue / 20.0, 1.5)
+        penalty += 0.2 * min(control_queue / 10.0, 1.0)
+    ru_stats = context.get("ru", {}).get(bs.bs_id, {})
+    temp_pen = max(ru_stats.get("temperature_c", 40.0) - 70.0, 0.0) / 40.0
+    penalty += temp_pen
+    core = context.get("core", {})
+    upf_pen = max(core.get("upf_load", 0.0) - 0.85, 0.0)
+    penalty += upf_pen
+    return penalty
+
+
+def strongest_signal_policy(ue, base_stations, context=None):
     return max(base_stations, key=lambda bs: signal_strength(ue, bs))
 
 
-def load_aware_policy(ue, base_stations, alpha=0.7, beta=0.3):
+def load_aware_policy(ue, base_stations, context=None, alpha=0.7, beta=0.3):
     """
     Simple AI-like heuristic:
     score = alpha * normalized signal - beta * current load
@@ -19,7 +40,8 @@ def load_aware_policy(ue, base_stations, alpha=0.7, beta=0.3):
     best_score = -1e9
 
     for bs, sig in zip(base_stations, signals):
-        score = alpha * (sig / max_sig) - beta * bs.load
+        transport_pen = _transport_penalty(bs, context)
+        score = alpha * (sig / max_sig) - beta * bs.load - 0.3 * transport_pen
         if score > best_score:
             best_score = score
             best_bs = bs
@@ -42,7 +64,7 @@ ADVANCED_WEIGHTS = {
 }
 
 
-def predictive_mobility_policy(ue, base_stations, weights=None):
+def predictive_mobility_policy(ue, base_stations, context=None, weights=None):
     """
     Advanced heuristic that mixes RF quality, cell load, UE latency pressure,
     and short-horizon mobility. It prefers cells the UE is moving toward,
@@ -78,6 +100,8 @@ def predictive_mobility_policy(ue, base_stations, weights=None):
         velocity_term = min(velocity / cfg["velocity_cap"], 1.0) * mobility_term
         stability_term = 1.0 if getattr(ue, "serving_bs", None) == bs.bs_id else 0.0
 
+        penalty = _transport_penalty(bs, context)
+
         score = (
             cfg["w_signal"] * sig_norm
             + cfg["w_load"] * load_term
@@ -86,6 +110,7 @@ def predictive_mobility_policy(ue, base_stations, weights=None):
             + cfg["w_mobility"] * mobility_term
             + cfg["w_velocity"] * velocity_term
             + cfg["w_stability"] * stability_term
+            - 0.5 * penalty
         )
         if score > best_score:
             best_score = score

@@ -131,6 +131,15 @@ class NetworkEnvironment:
             self.central_units = central_units
         self.radio_units = build_radio_units(self.distributed_units)
         self.f1_interfaces, self._bs_to_du = self._build_f1_interfaces(self.distributed_units)
+        self._last_f1_stats = {}
+        self._last_ru_metrics = {}
+        self._last_core_interface_stats = {}
+        self._policy_context = {
+            "bs_to_du": self._bs_to_du,
+            "f1": {},
+            "ru": {},
+            "core": {"upf_load": 0.0, "interface": {}},
+        }
         self._last_f1_stats = {du.du_id: {"control_packets": 0, "user_packets": 0, "control_queue": 0, "user_queue": 0} for du in self.distributed_units}
 
     def _blank_history(self):
@@ -155,6 +164,13 @@ class NetworkEnvironment:
             f1.user._queue.clear()
         for du_id in self._last_f1_stats:
             self._last_f1_stats[du_id] = {"control_packets": 0, "user_packets": 0, "control_queue": 0, "user_queue": 0}
+        for bs_id in self._last_ru_metrics:
+            self._last_ru_metrics[bs_id] = {"load": 0.0, "temperature_c": 40.0}
+        self._update_policy_context()
+
+    @property
+    def policy_context(self):
+        return self._policy_context
 
     def _build_f1_interfaces(self, distributed_units: List[DistributedUnit]):
         f1_map = {}
@@ -196,17 +212,17 @@ class NetworkEnvironment:
 
         self.reset_bs()
 
-            for u in self.users:
-                previous_bs = u.serving_bs
-                selected_bs = association_policy(u, self.base_stations)
-                if previous_bs is not None and previous_bs != selected_bs.bs_id:
-                    handover_events[u.ue_id] = 1
-                else:
-                    handover_events[u.ue_id] = 0
-                u.previous_bs = previous_bs
-                u.serving_bs = selected_bs.bs_id
-                selected_bs.add_user(u)
-                self._enqueue_f1_control(u, previous_bs, selected_bs.bs_id)
+        for u in self.users:
+            previous_bs = u.serving_bs
+            selected_bs = association_policy(u, self.base_stations, self.policy_context)
+            if previous_bs is not None and previous_bs != selected_bs.bs_id:
+                handover_events[u.ue_id] = 1
+            else:
+                handover_events[u.ue_id] = 0
+            u.previous_bs = previous_bs
+            u.serving_bs = selected_bs.bs_id
+            selected_bs.add_user(u)
+            self._enqueue_f1_control(u, previous_bs, selected_bs.bs_id)
 
         self._finalize_step(handover_events, update_history=True)
 
@@ -588,6 +604,10 @@ class NetworkEnvironment:
                     labels=labels,
                     timestamp=timestamp,
                 )
+                self._last_ru_metrics[ru.base_station.bs_id] = {
+                    "load": util,
+                    "temperature_c": ru.temperature_c,
+                }
 
         avg_throughput = float(np.mean(throughputs)) if throughputs else 0.0
         avg_latency = float(np.mean(latencies)) if latencies else 0.0
@@ -703,8 +723,9 @@ class NetworkEnvironment:
                 for ue_id, metrics in per_user_metrics.items()
             }
             self.core_network.update_traffic(per_user_throughput)
-            self.core_network.service_interfaces()
+            self._last_core_interface_stats = self.core_network.service_interfaces() or {}
             self.core_network.emit_metrics(timestamp)
+        self._update_policy_context()
 
     def _estimate_handover_success(self, handover_events, per_user_metrics):
         successes = 0
@@ -772,3 +793,16 @@ class NetworkEnvironment:
                 "user_queue": interface.user.queue_depth(),
             }
             self._last_f1_stats[du_id] = stats
+        self._update_policy_context()
+
+    def _update_policy_context(self):
+        core_context = {
+            "upf_load": self.core_network.upf.load_ratio if self.core_network else 0.0,
+            "interface": self._last_core_interface_stats or {},
+        }
+        self._policy_context = {
+            "bs_to_du": self._bs_to_du,
+            "f1": dict(self._last_f1_stats),
+            "ru": dict(self._last_ru_metrics),
+            "core": core_context,
+        }

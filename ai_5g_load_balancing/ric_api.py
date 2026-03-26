@@ -184,7 +184,9 @@ class SimulationManager:
     def _heuristic_actions(self) -> List[int]:
         actions = []
         for idx, ue in enumerate(self.env.users):
-            best_bs = predictive_mobility_policy(ue, self.env.base_stations)
+            best_bs = predictive_mobility_policy(
+                ue, self.env.base_stations, context=self.env.policy_context
+            )
             actions.append(self._candidate_index(idx, best_bs.bs_id))
         return actions
 
